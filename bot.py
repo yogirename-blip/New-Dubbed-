@@ -127,7 +127,7 @@ def add_slots(segs, total):
 
 
 # ---------------------------------------------------------------- translate
-def gemini_batch(items, src_lang):
+def gemini_batch(items, src_lang, model):
     payload = [{"id": k, "text": s["text"],
                 "max_chars": max(10, int(s["slot"] * CHARS_PER_SEC))}
                for k, s in enumerate(items)]
@@ -142,11 +142,11 @@ def gemini_batch(items, src_lang):
         "Return ONLY a JSON array of strings, same order and same count as the input.\n\n"
         "INPUT:\n" + json.dumps(payload, ensure_ascii=False))
     url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}")
+           f"{model}:generateContent?key={GEMINI_KEY}")
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.3,
                                  "responseMimeType": "application/json"}}
-    r = httpx.post(url, json=body, timeout=180)
+    r = httpx.post(url, json=body, timeout=60)
     r.raise_for_status()
     txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
     txt = re.sub(r"^```(?:json)?|```$", "", txt.strip(), flags=re.M).strip()
@@ -156,9 +156,20 @@ def gemini_batch(items, src_lang):
     return [str(x).strip() for x in arr]
 
 
+GEMINI_MODELS = list(dict.fromkeys(
+    [GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-flash-latest",
+     "gemini-3-flash-preview"]))
+
+
 def fallback_translate(text):
     from deep_translator import GoogleTranslator
-    return GoogleTranslator(source="auto", target="ta").translate(text) or text
+    for a in range(3):
+        try:
+            return GoogleTranslator(source="auto", target="ta").translate(text) or ""
+        except Exception as e:
+            print("GT retry:", str(e)[:100])
+            time.sleep(4 + a * 6)
+    return ""
 
 
 def translate_all(segs, src_lang):
@@ -168,21 +179,24 @@ def translate_all(segs, src_lang):
         chunk = segs[i:i + B]
         res = None
         if GEMINI_KEY:
-            for attempt in range(3):
-                try:
-                    res = gemini_batch(chunk, src_lang)
+            for model in GEMINI_MODELS:
+                for attempt in range(2):
+                    try:
+                        res = gemini_batch(chunk, src_lang, model)
+                        break
+                    except Exception as e:
+                        print(f"Gemini {model} retry:", str(e)[:120])
+                        time.sleep(3 + attempt * 4)
+                if res is not None:
                     break
-                except Exception as e:
-                    print("Gemini retry:", e)
-                    time.sleep(2 + attempt * 3)
         if res is None:
             res = []
             for s in chunk:
-                try:
-                    res.append(fallback_translate(s["text"]))
-                except Exception:
-                    res.append("")
+                res.append(fallback_translate(s["text"]))
+                time.sleep(1.5)
         out.extend(res)
+    if not any((t or "").strip() for t in out):
+        raise RuntimeError("மொழிபெயர்ப்பு fail ஆச்சு, கொஞ்ச நேரம் கழித்து மறுபடி முயற்சி செய்")
     return out
 
 
