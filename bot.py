@@ -40,7 +40,7 @@ async def start_dubbing(path: str) -> str:
         "source_lang": "auto",
         "num_speakers": "0",      # 0 = auto-detect speakers
         "watermark": os.environ.get("WATERMARK", "true").lower(),  # Free plan needs true
-        "highest_resolution": "true",
+        "highest_resolution": os.environ.get("HIGHEST_RES", "false").lower(),  # Creator+ only
     }
     timeout = httpx.Timeout(60.0, read=3600.0, write=3600.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
