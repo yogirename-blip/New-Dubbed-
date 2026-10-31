@@ -227,15 +227,27 @@ def _gem_candidates():
 
 
 STYLE = {
-    "ta": ("Use everyday COLLOQUIAL spoken Tamil (பேச்சு வழக்கு) exactly like friends talking, "
-           "NOT formal/literary Tamil (செந்தமிழ்). Never use bookish endings like -கிறேன், -கிறோம், "
-           "-கிறாய், -கிறார்கள், or words like நாங்கள், இங்கு, அங்கு, எவ்வாறு, யாது. "
-           "Examples: 'இங்கு நாங்கள் வந்திருக்கிறோம்' -> 'இங்க நாங்க வந்திருக்கோம்'; "
-           "'நான் வந்திருக்கிறேன்' -> 'நான் வந்திருக்கேன்'; "
-           "'என்ன செய்கிறாய்?' -> 'என்ன பண்ற?'; 'எனக்கு தெரியாது' -> 'எனக்கு தெரியாது'; "
-           "'நான் போகிறேன்' -> 'நான் போறேன்'; 'அவர்கள் வருகிறார்கள்' -> 'அவங்க வராங்க'; "
-           "'நீங்கள் என்ன சொல்கிறீர்கள்?' -> 'நீங்க என்ன சொல்றீங்க?'. "
-           "Short, punchy, natural like a Tamil movie dialogue."),
+    "ta": ("Write like a modern Tamil FILM DIALOGUE writer: everyday COLLOQUIAL spoken Tamil "
+           "(பேச்சு வழக்கு, Chennai/Madurai street-casual), the way friends talk. "
+           "NEVER write literary/formal Tamil (செந்தமிழ்): no endings like -கிறேன், -கிறோம், -கிறாய், "
+           "-கிறீர்கள், -கிறார்கள், -கிறது; no நாங்கள், நீங்கள், அவர்கள், இங்கு, அங்கு, எங்கு, "
+           "இப்போது, மிகவும், வேண்டும், இல்லை. Use நாங்க, நீங்க, அவங்க, இங்க, அங்க, எங்க, "
+           "இப்போ, ரொம்ப, வேணும், இல்ல instead. Use short punchy sentences, natural fillers "
+           "(டா, டி, ப்பா, சரி, அட, ஏய், பாரு, விடு) when the tone fits. "
+           "Style examples (original, in the spirit of Tamil cinema):\n"
+           "[casual] 'We have come here.' -> 'நாங்க இங்க வந்திருக்கோம்.'\n"
+           "[casual] 'I am coming.' -> 'நான் வந்துட்டே இருக்கேன்.'\n"
+           "[casual] 'What are you doing?' -> 'என்ன பண்ற?'\n"
+           "[casual] 'Do not worry about it.' -> 'அதப் பத்தி கவலைப்படாத.'\n"
+           "[friends] 'I do not know anything.' -> 'எனக்கு ஒண்ணுமே தெரியாதுப்பா.'\n"
+           "[friends] 'Why are you shouting at me?' -> 'ஏன் என்மேல கத்துற?'\n"
+           "[friends] 'Come on, let us go.' -> 'வா டா, போலாம்.'\n"
+           "[angry] 'Get out of my sight right now.' -> 'முதல்ல என் கண்ணு முன்னாடி நிக்காத, போ!'\n"
+           "[angry] 'Who gave you the right to decide?' -> 'முடிவு பண்ண உனக்கு யாரு உரிமை குடுத்தா?'\n"
+           "[emotional] 'I missed you so much.' -> 'உன்ன ரொம்ப மிஸ் பண்ணேன் டா.'\n"
+           "[emotional] 'Please forgive me.' -> 'என்ன மன்னிச்சிடு, ப்ளீஸ்.'\n"
+           "[serious] 'We have no time left.' -> 'நம்ம கிட்ட நேரமே இல்ல.'\n"
+           "[serious] 'They are coming for us.' -> 'அவங்க நம்மள தேடி வராங்க.'"),
     "te": ("Use everyday colloquial spoken Telugu (వ్యావహారిక భాష) like friends talking, "
            "not bookish/formal Telugu."),
     "ml": ("Use everyday colloquial spoken Malayalam (സംസാരഭാഷ) like friends talking, "
@@ -305,6 +317,46 @@ def gemini_batch(items, src_lang, tgt="ta"):
     raise RuntimeError("Gemini வேலை செய்யல: " + last)
 
 
+_TA = r"(?<![\u0B80-\u0BFF])"
+_TA_END = r"(?![\u0B80-\u0BFF])"
+_WORDS = {
+    "நாங்கள்": "நாங்க", "நீங்கள்": "நீங்க", "அவர்கள்": "அவங்க", "இவர்கள்": "இவங்க",
+    "எங்களுக்கு": "எங்களுக்கு", "அவர்களுக்கு": "அவங்களுக்கு", "அவர்களை": "அவங்கள",
+    "இங்கு": "இங்க", "அங்கு": "அங்க", "எங்கு": "எங்க", "இப்போது": "இப்போ",
+    "அப்போது": "அப்போ", "எப்போது": "எப்போ", "மிகவும்": "ரொம்ப", "மிக": "ரொம்ப",
+    "வேண்டும்": "வேணும்", "வேண்டாம்": "வேணாம்", "இல்லை": "இல்ல", "ஆமாம்": "ஆமா",
+    "என்னுடைய": "என்னோட", "உன்னுடைய": "உன்னோட", "அவருடைய": "அவரோட",
+    "உங்களுடைய": "உங்களோட", "எங்களுடைய": "எங்களோட", "அவளுடைய": "அவளோட",
+    "என்ன செய்கிறாய்": "என்ன பண்ற", "என்ன செய்கிறீர்கள்": "என்ன பண்றீங்க",
+    "செய்கிறேன்": "பண்றேன்", "செய்கிறோம்": "பண்றோம்", "செய்கிறாய்": "பண்ற",
+    "செய்கிறீர்கள்": "பண்றீங்க", "செய்கிறார்கள்": "பண்றாங்க", "செய்கிறான்": "பண்றான்",
+    "போகிறேன்": "போறேன்", "போகிறோம்": "போறோம்", "போகிறாய்": "போற",
+    "போகிறீர்கள்": "போறீங்க", "போகிறார்கள்": "போறாங்க", "போகிறான்": "போறான்",
+    "வருகிறேன்": "வரேன்", "வருகிறோம்": "வரோம்", "வருகிறாய்": "வர்ற",
+    "வருகிறீர்கள்": "வரீங்க", "வருகிறார்கள்": "வராங்க", "வருகிறான்": "வரான்",
+    "சொல்கிறேன்": "சொல்றேன்", "சொல்கிறாய்": "சொல்ற", "சொல்கிறீர்கள்": "சொல்றீங்க",
+    "சொல்கிறார்கள்": "சொல்றாங்க", "பேசுகிறேன்": "பேசுறேன்", "பேசுகிறாய்": "பேசுற",
+    "பேசுகிறீர்கள்": "பேசுறீங்க", "பேசுகிறார்கள்": "பேசுறாங்க",
+}
+_ENDINGS = [   # வினை முடிவுகள் (suffix)
+    ("ருக்கிறேன்", "ருக்கேன்"), ("ருக்கிறோம்", "ருக்கோம்"), ("ருக்கிறாய்", "ருக்க"),
+    ("ருக்கிறீர்கள்", "ருக்கீங்க"), ("ருக்கிறார்கள்", "ருக்காங்க"),
+    ("ருக்கிறார்", "ருக்காரு"), ("ருக்கிறாள்", "ருக்கா"), ("ருக்கிறான்", "ருக்கான்"),
+    ("ருக்கிறது", "ருக்கு"), ("ருக்கின்றன", "ருக்கு"),
+]
+_WORD_RE = re.compile(_TA + "(" + "|".join(sorted(map(re.escape, _WORDS), key=len, reverse=True)) + ")" + _TA_END)
+
+
+def colloquial_ta(text):
+    """செந்தமிழ் சொற்களை பேச்சு வழக்குக்கு மாத்துது (Gemini விட்டுப்போனதையும் பிடிக்கும்)."""
+    if not text:
+        return text
+    t = _WORD_RE.sub(lambda m: _WORDS[m.group(1)], text)
+    for a, b in _ENDINGS:
+        t = re.sub(a + _TA_END, b, t)
+    return t
+
+
 def fallback_translate(text, tgt="ta"):
     from deep_translator import GoogleTranslator
     last = None
@@ -341,6 +393,8 @@ def translate_all(segs, src_lang, tgt="ta"):
                     log("Google Translate failed:", repr(e2)[:150])
                     res.append("")
                 time.sleep(0.5)
+        if tgt == "ta":
+            res = [colloquial_ta(x) for x in res]
         log("translated sample:", [x[:40] for x in res[:2]])
         out.extend(res)
     if not any((t or "").strip() for t in out):
