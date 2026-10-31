@@ -457,9 +457,16 @@ STYLE = {
            "[emotional] 'Please forgive me.' -> 'என்ன மன்னிச்சிடு, ப்ளீஸ்.'\n"
            "[serious] 'We have no time left.' -> 'நம்ம கிட்ட நேரமே இல்ல.'\n"
            "[serious] 'They are coming for us.' -> 'அவங்க நம்மள தேடி வராங்க.'\n"
+           "[revenge] 'I hold a grudge against you.' -> 'நான் உனக்கு வஞ்சம் வச்சிருக்கேன்.'\n"
+           "[revenge] 'Because I hold a grudge, I am going to destroy you.' -> "
+           "'உன்மேல வஞ்சம் வச்சிருக்கிறதால உன்ன அழிக்கப் போறேன்.'\n"
+           "[revenge] 'I will not leave you alone.' -> 'உன்ன சும்மா விடமாட்டேன்.'\n"
            "[daily] 'Did you eat?' -> 'சாப்பிட்டியா?'  'I ate.' -> 'சாப்பிட்டேன்.'\n"
            "[daily] 'What am I doing now?' -> 'இப்போ என்ன பண்ணுறேன்?'\n"
            "[daily] 'I have come only here.' -> 'நான் இங்கதான் வந்திருக்கேன்.'\n"
+           "Never use bookish forms like வைத்துள்ளேன், வந்துள்ளேன், செய்துள்ளேன், வைத்துக்கொள்கிறேன், "
+           "வந்தனர், அழிக்கப் போகிறேன்; say வச்சிருக்கேன், வந்திருக்கேன், பண்ணியிருக்கேன், வச்சுக்கிறேன், "
+           "வந்தாங்க, அழிக்கப் போறேன். "
            "Always use these casual verb forms: பண்ணுறேன்/பண்ணுற/பண்ணுறீங்க, சாப்பிட்டியா, "
            "வர்றேன், போறேன், சொல்றேன், பார்க்குறேன். Never write செய்கிறேன்/வருகிறேன்/சாப்பிட்டாயா."),
     "te": ("Use everyday colloquial spoken Telugu (వ్యావహారిక భాష) like friends talking, "
@@ -578,6 +585,12 @@ _WORDS = {
     "பேசுகிறீர்கள்": "பேசுறீங்க", "பேசுகிறார்கள்": "பேசுறாங்க",
 }
 _WORDS.update({
+    "உள்ளது": "இருக்கு", "உள்ளேன்": "இருக்கேன்", "உள்ளோம்": "இருக்கோம்", "உள்ளாய்": "இருக்க",
+    "உள்ளீர்கள்": "இருக்கீங்க", "உள்ளார்கள்": "இருக்காங்க", "உள்ளான்": "இருக்கான்",
+    "உள்ளாள்": "இருக்கா", "உள்ளார்": "இருக்காரு",
+    "செய்துள்ளேன்": "பண்ணியிருக்கேன்", "செய்துள்ளோம்": "பண்ணியிருக்கோம்",
+    "செய்துள்ளார்கள்": "பண்ணியிருக்காங்க", "செய்துள்ளான்": "பண்ணியிருக்கான்",
+    "செய்துள்ளது": "பண்ணியிருக்கு", "செய்துள்ளாய்": "பண்ணியிருக்க",
     "நாம்": "நாம", "அவ்வளவு": "அவ்ளோ", "இவ்வளவு": "இவ்ளோ", "எவ்வளவு": "எவ்ளோ",
     "ஏனென்றால்": "ஏன்னா", "ஆனால்": "ஆனா", "மற்றும்": "அப்புறம்", "எனவே": "அதனால",
     "தயவுசெய்து": "ப்ளீஸ்", "என்னை": "என்ன", "உன்னை": "உன்ன", "அவனை": "அவன",
@@ -585,10 +598,26 @@ _WORDS.update({
     "அதை": "அத", "இதை": "இத", "எதை": "எத", "அவரை": "அவர", "என்றால்": "னா",
     "கிடையாது": "கிடையாது", "தான்": "தான்", "அல்லவா": "இல்லையா", "பிறகு": "அப்புறம்",
 })
+_PERF_STEM = {"த்த": "ச்சி", "ந்த": "ந்தி", "ட்ட": "ட்டி"}
+_PERF_END = {"ேன்": "கேன்", "ோம்": "கோம்", "ாய்": "க", "ீர்கள்": "கீங்க", "ார்கள்": "காங்க",
+             "ான்": "கான்", "ாள்": "கா", "ார்": "காரு", "து": "கு"}
+_PERF_RE = re.compile("(த்த|ந்த|ட்ட)ுள்ள(ேன்|ோம்|ாய்|ீர்கள்|ார்கள்|ான்|ாள்|ார்|து)" + _TA_END)
+_PLURAL_RE = re.compile("(ந்த|ட்ட|ன்ற|த்த)னர்" + _TA_END)
+_REFLEX_RE = re.compile("த்துக்\\s?கொள்கிற(ேன்|ோம்|ாய்|ீர்கள்|ார்கள்|ான்|ாள்|ார்)" + _TA_END)
 _VERB_STEM = {"க்": "க்குற", "ு": "ுற", "ல்": "ல்ற", "ள்": "ள்ற", "ய்": "ய்ற"}
 _VERB_END = {"ேன்": "ேன்", "ோம்": "ோம்", "ாய்": "", "ீர்கள்": "ீங்க", "ார்கள்": "ாங்க",
              "ான்": "ான்", "ாள்": "ா", "ார்": "ாரு"}
 _VERB_RE = re.compile("(க்|ு|ல்|ள்|ய்)கிற(ேன்|ோம்|ாய்|ீர்கள்|ார்கள்|ான்|ாள்|ார்|து)" + _TA_END)
+
+
+def _perf_sub(m):
+    return _PERF_STEM[m.group(1)] + "ருக்" + _PERF_END[m.group(2)]
+
+
+def _reflex_sub(m):
+    end = {"ேன்": "ேன்", "ோம்": "ோம்", "ாய்": "", "ீர்கள்": "ீங்க", "ார்கள்": "ாங்க",
+           "ான்": "ான்", "ாள்": "ா", "ார்": "ாரு"}[m.group(1)]
+    return "ச்சுக்கிற" + end if end else "ச்சுக்கிற"
 
 
 def _verb_sub(m):
@@ -615,20 +644,28 @@ def colloquial_ta(text):
     t = _WORD_RE.sub(lambda m: _WORDS[m.group(1)], text)
     for a, b in _ENDINGS:
         t = re.sub(a + _TA_END, b, t)
+    t = _REFLEX_RE.sub(_reflex_sub, t)
+    t = _PERF_RE.sub(_perf_sub, t)
+    t = _PLURAL_RE.sub(lambda m: m.group(1) + "ாங்க", t)
+    t = re.sub("கின்ற(ேன்|ோம்|ாய்|ீர்கள்|ார்கள்|ான்|ாள்|ார்)", "கிற\\1", t)
     t = _VERB_RE.sub(_verb_sub, t)
     return t
 
 
 _FORMAL_RE = re.compile(
     "கிற(?:ேன்|ோம்|ாய்|ீர்கள்|ார்கள்|ான்|ாள்|ார்|து)|நாங்கள்|நீங்கள்|இங்கு|அங்கு|வேண்டும்|இல்லை"
-    "|அவர்கள்|மிகவும்")
+    "|அவர்கள்|மிகவும்|ுள்ள(?:ேன்|ோம்|ாய்|ீர்கள்|ார்கள்|ான்|ாள்|ார்|து)|கின்ற|னர்\\b|கொள்கிற|வேண்டிய"
+    "|இவ்வாறு|அவ்வாறு|எவ்வாறு|ஆயினும்|மேலும்|இருப்பினும்")
+ALWAYS_REWRITE = os.environ.get("ALWAYS_REWRITE", "1") == "1"
 
 
 def gemini_colloquialize(lines, tgt="ta"):
     """இன்னும் செந்தமிழ்ல இருக்கிற வரிகளை மட்டும் பேச்சு வழக்குக்கு திருப்பி எழுத (ஒரு முறை)."""
     system = ("Rewrite each Tamil dubbing line from formal/literary Tamil into natural COLLOQUIAL spoken "
               "Tamil (பேச்சு வழக்கு) exactly like friends talking in a Tamil film. Keep the meaning, "
-              "emotion, punctuation and roughly the same length (never longer). " + STYLE["ta"] +
+              "emotion, punctuation and roughly the same length (never longer). If a line is already "
+              "colloquial keep it. Typical fixes: வைத்துள்ளேன் -> வச்சிருக்கேன், வந்தனர் -> வந்தாங்க, "
+              "செய்கிறேன் -> பண்ணுறேன், நாங்கள் -> நாங்க. " + STYLE["ta"] +
               "\nReturn ONLY a JSON array of strings, same order and count.")
     user = "INPUT:\n" + json.dumps(lines, ensure_ascii=False)
     items = [{"text": t, "slot": 3.0} for t in lines]
@@ -673,7 +710,8 @@ def translate_all(segs, src_lang, tgt="ta"):
                 time.sleep(0.5)
         if tgt == "ta":
             res = [colloquial_ta(x) for x in res]
-            bad = [k for k, x in enumerate(res) if x and _FORMAL_RE.search(x)]
+            bad = [k for k, x in enumerate(res)
+                   if x and (ALWAYS_REWRITE or _FORMAL_RE.search(x))]
             if bad and GEMINI_KEY:
                 try:
                     fixed = gemini_colloquialize([res[k] for k in bad], tgt)
@@ -1135,4 +1173,3 @@ if __name__ == "__main__":
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
     loop.run_until_complete(main())
- 
