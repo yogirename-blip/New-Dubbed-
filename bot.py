@@ -226,6 +226,27 @@ def _gem_candidates():
     return out
 
 
+STYLE = {
+    "ta": ("Use everyday COLLOQUIAL spoken Tamil (பேச்சு வழக்கு) exactly like friends talking, "
+           "NOT formal/literary Tamil (செந்தமிழ்). Never use bookish endings like -கிறேன், -கிறோம், "
+           "-கிறாய், -கிறார்கள், or words like நாங்கள், இங்கு, அங்கு, எவ்வாறு, யாது. "
+           "Examples: 'இங்கு நாங்கள் வந்திருக்கிறோம்' -> 'இங்க நாங்க வந்திருக்கோம்'; "
+           "'நான் வந்திருக்கிறேன்' -> 'நான் வந்திருக்கேன்'; "
+           "'என்ன செய்கிறாய்?' -> 'என்ன பண்ற?'; 'எனக்கு தெரியாது' -> 'எனக்கு தெரியாது'; "
+           "'நான் போகிறேன்' -> 'நான் போறேன்'; 'அவர்கள் வருகிறார்கள்' -> 'அவங்க வராங்க'; "
+           "'நீங்கள் என்ன சொல்கிறீர்கள்?' -> 'நீங்க என்ன சொல்றீங்க?'. "
+           "Short, punchy, natural like a Tamil movie dialogue."),
+    "te": ("Use everyday colloquial spoken Telugu (వ్యావహారిక భాష) like friends talking, "
+           "not bookish/formal Telugu."),
+    "ml": ("Use everyday colloquial spoken Malayalam (സംസാരഭാഷ) like friends talking, "
+           "not bookish/formal Malayalam."),
+    "kn": ("Use everyday colloquial spoken Kannada (ಆಡುಮಾತು) like friends talking, "
+           "not bookish/formal Kannada."),
+    "hi": ("Use everyday casual spoken Hindi (Hinglish-free, Devanagari) like friends talking, "
+           "avoid heavy Sanskritised words."),
+}
+
+
 def _gem_prompt(items, src_lang, tgt="ta"):
     _, name, _, script, cps = LANGS[tgt]
     payload = [{"id": k, "text": s_["text"],
@@ -235,7 +256,8 @@ def _gem_prompt(items, src_lang, tgt="ta"):
         f"You are a professional {name} dubbing writer. Translate each line "
         f"(source language: {src_lang or 'auto'}) into natural spoken {name} ({script} script) "
         "for dubbing a video.\n"
-        "Rules: keep meaning and emotion; casual spoken style that fits the scene; "
+        "Rules: keep meaning and emotion; " + STYLE.get(tgt, "casual spoken style") + " "
+        "Match the speaker's tone and the scene; "
         "each translation MUST be at most max_chars characters (shorten the wording if "
         f"needed, never exceed it); write names in {script} script; write numbers as "
         f"{name} words; no English letters, no emojis, no explanations.\n"
