@@ -136,6 +136,24 @@ def transcribe(vocals_path):
     return segs, words, info.language
 
 
+def merge_segments(segs, max_gap=0.7, max_dur=11.0, max_chars=260):
+    """சின்ன சின்ன வசனங்களை ஒண்ணா சேர்த்து, ஒரே ஓட்டத்துல (flow) பேச வைக்க."""
+    out = []
+    for s in segs:
+        if out:
+            p = out[-1]
+            gap = s["start"] - p["end"]
+            ends_sentence = p["text"].rstrip()[-1:] in ".?!…。"
+            if (gap <= max_gap and (s["end"] - p["start"]) <= max_dur
+                    and len(p["text"]) + len(s["text"]) + 1 <= max_chars
+                    and (not ends_sentence or gap <= 0.35)):
+                p["end"] = s["end"]
+                p["text"] = p["text"].rstrip() + " " + s["text"].lstrip()
+                continue
+        out.append(dict(s))
+    return out
+
+
 def add_slots(segs, total):
     """ஒவ்வொரு வசனத்துக்கும் அதிகபட்சம் எவ்வளவு நேரம் பேசலாம்னு கணக்கு."""
     for i, s in enumerate(segs):
@@ -259,28 +277,42 @@ STYLE = {
 }
 
 
+FLOW_RULES = (
+    "The lines are CONSECUTIVE dialogue from one video scene. Translate them as ONE continuous, "
+    "flowing conversation, not as isolated sentences: join ideas with natural connectors "
+    "(அதான், அப்போ, சரி, அது தான், ஆனா...) so it sounds like real people talking without stiff pauses. "
+    "Infer each speaker's character from the lines (age, gender, background, mood, relationship: "
+    "kids, elders, street/rowdy, college friends, family, polite officer, narrator) and adapt the "
+    "register to that character; even a narrator must sound conversational, never bookish. "
+    "Flow example: 'We came all this way, and this is the place.' -> "
+    "'இவ்ளோ தூரம் வந்தது இதுக்குத்தான், இதுதான் அந்த இடம்.'"
+)
+
+
 def _gem_prompt(items, src_lang, tgt="ta"):
+    """(system instruction, user text)"""
     _, name, _, script, cps = LANGS[tgt]
     payload = [{"id": k, "text": s_["text"],
                 "max_chars": max(10, int(s_["slot"] * cps))}
                for k, s_ in enumerate(items)]
-    return (
-        f"You are a professional {name} dubbing writer. Translate each line "
-        f"(source language: {src_lang or 'auto'}) into natural spoken {name} ({script} script) "
-        "for dubbing a video.\n"
-        "Rules: keep meaning and emotion; " + STYLE.get(tgt, "casual spoken style") + " "
-        "Match the speaker's tone and the scene; "
-        "each translation MUST be at most max_chars characters (shorten the wording if "
-        f"needed, never exceed it); write names in {script} script; write numbers as "
-        f"{name} words; no English letters, no emojis, no explanations.\n"
-        "Return ONLY a JSON array of strings, same order and same count as the input.\n\n"
-        "INPUT:\n" + json.dumps(payload, ensure_ascii=False))
+    system = (
+        f"You are a professional {name} dubbing writer for films and series. Translate each line "
+        f"(source language: {src_lang or 'auto'}) into {name} ({script} script) for dubbing.\n"
+        + STYLE.get(tgt, "Use casual spoken style.") + "\n" + FLOW_RULES + "\n"
+        "Rules: keep meaning and emotion; each translation MUST be at most max_chars characters "
+        f"(shorten the wording if needed, never exceed it); write names in {script} script; write "
+        f"numbers as {name} words; no English letters, no emojis, no explanations.\n"
+        "Return ONLY a JSON array of strings, same order and same count as the input.")
+    user = "INPUT:\n" + json.dumps(payload, ensure_ascii=False)
+    return system, user
 
 
 def gemini_batch(items, src_lang, tgt="ta"):
     global _GEM_MODEL
-    body = {"contents": [{"parts": [{"text": _gem_prompt(items, src_lang, tgt)}]}],
-            "generationConfig": {"temperature": 0.3,
+    system, user = _gem_prompt(items, src_lang, tgt)
+    body = {"systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "generationConfig": {"temperature": 0.5,
                                  "responseMimeType": "application/json"}}
     models = [_GEM_MODEL] if _GEM_MODEL else _gem_candidates()
     last = "model இல்ல"
@@ -338,6 +370,27 @@ _WORDS = {
     "சொல்கிறார்கள்": "சொல்றாங்க", "பேசுகிறேன்": "பேசுறேன்", "பேசுகிறாய்": "பேசுற",
     "பேசுகிறீர்கள்": "பேசுறீங்க", "பேசுகிறார்கள்": "பேசுறாங்க",
 }
+_WORDS.update({
+    "நாம்": "நாம", "அவ்வளவு": "அவ்ளோ", "இவ்வளவு": "இவ்ளோ", "எவ்வளவு": "எவ்ளோ",
+    "ஏனென்றால்": "ஏன்னா", "ஆனால்": "ஆனா", "மற்றும்": "அப்புறம்", "எனவே": "அதனால",
+    "தயவுசெய்து": "ப்ளீஸ்", "என்னை": "என்ன", "உன்னை": "உன்ன", "அவனை": "அவன",
+    "அவளை": "அவள", "உங்களை": "உங்கள", "எங்களை": "எங்கள", "நம்மை": "நம்மள",
+    "அதை": "அத", "இதை": "இத", "எதை": "எத", "அவரை": "அவர", "என்றால்": "னா",
+    "கிடையாது": "கிடையாது", "தான்": "தான்", "அல்லவா": "இல்லையா", "பிறகு": "அப்புறம்",
+})
+_VERB_STEM = {"க்": "க்குற", "ு": "ுற", "ல்": "ல்ற", "ள்": "ள்ற", "ய்": "ய்ற"}
+_VERB_END = {"ேன்": "ேன்", "ோம்": "ோம்", "ாய்": "", "ீர்கள்": "ீங்க", "ார்கள்": "ாங்க",
+             "ான்": "ான்", "ாள்": "ா", "ார்": "ாரு"}
+_VERB_RE = re.compile("(க்|ு|ல்|ள்|ய்)கிற(ேன்|ோம்|ாய்|ீர்கள்|ார்கள்|ான்|ாள்|ார்|து)" + _TA_END)
+
+
+def _verb_sub(m):
+    stem, end = m.group(1), m.group(2)
+    if end == "து":
+        return {"க்": "க்குது", "ு": "ுது", "ல்": "ல்லுது", "ள்": "ள்ளுது", "ய்": "ய்யுது"}[stem]
+    return _VERB_STEM[stem] + _VERB_END[end]
+
+
 _ENDINGS = [   # வினை முடிவுகள் (suffix)
     ("ருக்கிறேன்", "ருக்கேன்"), ("ருக்கிறோம்", "ருக்கோம்"), ("ருக்கிறாய்", "ருக்க"),
     ("ருக்கிறீர்கள்", "ருக்கீங்க"), ("ருக்கிறார்கள்", "ருக்காங்க"),
@@ -354,6 +407,7 @@ def colloquial_ta(text):
     t = _WORD_RE.sub(lambda m: _WORDS[m.group(1)], text)
     for a, b in _ENDINGS:
         t = re.sub(a + _TA_END, b, t)
+    t = _VERB_RE.sub(_verb_sub, t)
     return t
 
 
@@ -484,12 +538,16 @@ def pipeline(src, workdir, out_path, progress, opts):
     segs, words, src_lang = transcribe(vocals)
     if not segs:
         raise RuntimeError("வீடியோவில் பேச்சு எதுவும் கிடைக்கல")
-    add_slots(segs, total)
     log("whisper done:", len(segs), "segments, lang", src_lang)
 
-    progress("💬 English subtitle தயார் பண்றேன்...", 38)
+    progress("💬 English subtitle தயார் பண்றேன்...", 36)
     srt_path = os.path.join(workdir, "english.srt")
     n_subs = write_srt(english_subs(vocals, src_lang, segs), srt_path)
+
+    raw_n = len(segs)
+    segs = merge_segments(segs)          # flow-க்காக சேர்த்தல் (subtitle raw-ல இருந்து)
+    add_slots(segs, total)
+    log(f"merged for flow: {raw_n} -> {len(segs)} segments")
 
     voc, vsr = sf.read(vocals, always_2d=True)
     voc = voc.mean(axis=1).astype(np.float32)
