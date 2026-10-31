@@ -130,10 +130,199 @@ def transcribe(vocals_path):
         text = (s.text or "").strip()
         if not text:
             continue
-        segs.append({"start": float(s.start), "end": float(s.end), "text": text})
+        st, en = float(s.start), float(s.end)
+        if s.words:                           # வார்த்தை நேரம் இன்னும் துல்லியம்
+            st, en = float(s.words[0].start), float(s.words[-1].end)
+        segs.append({"start": st, "end": max(en, st + 0.2), "text": text})
         for w in (s.words or []):
             words.append((float(w.start), float(w.end), w.word))
     return segs, words, info.language
+
+
+# ---------------------------------------------------------------- speakers / voice analysis
+SR16 = 16000
+FX_GAIN = float(os.environ.get("FX_GAIN", "0.85"))     # அசல் சிரிப்பு/அலறல் சத்தம்
+LEAD = 0.05                                            # டப் குரல் கொஞ்சம் முன்னாடியே தொடங்க
+
+
+def to16(x, sr):
+    g = gcd(SR16, sr)
+    return resample_poly(x, SR16 // g, sr // g).astype(np.float32)
+
+
+def voiced_f0(clip, sr=SR16, fmin=70, fmax=420):
+    """குரலோட pitch (Hz) median; குரல் இல்லன்னா None."""
+    if len(clip) < sr * 0.3:
+        return None
+    try:
+        f = librosa.yin(clip, fmin=fmin, fmax=fmax, sr=sr, frame_length=1024, hop_length=256)
+        r = librosa.feature.rms(y=clip, frame_length=1024, hop_length=256)[0]
+    except Exception:
+        return None
+    n = min(len(f), len(r))
+    f, r = f[:n], r[:n]
+    ok = (r > np.percentile(r, 45)) & (f > fmin * 1.05) & (f < fmax * 0.95)
+    if int(ok.sum()) < 6:
+        return None
+    return float(np.median(f[ok]))
+
+
+def assign_speakers(segs, voc16):
+    """ஆண்/பெண் + ஆளை (speaker) கண்டுபிடிக்கும் (pitch + MFCC clustering)."""
+    mfs, f0s = [], []
+    for s in segs:
+        clip = voc16[int(s["start"] * SR16):int(s["end"] * SR16)]
+        f0 = voiced_f0(clip)
+        f0s.append(f0)
+        mf = None
+        if len(clip) > SR16 * 0.4:
+            try:
+                mf = librosa.feature.mfcc(y=clip, sr=SR16, n_mfcc=13).mean(axis=1)
+            except Exception:
+                mf = None
+        mfs.append(mf)
+        s["f0s"] = [f0] if f0 else []
+
+    known = [f for f in f0s if f]
+    thr = 165.0
+    if len(known) >= 6:                       # ரெண்டு குழு தெளிவா இருந்தா threshold-ஐ பொருத்து
+        lo, hi = np.percentile(known, 20), np.percentile(known, 80)
+        if hi / max(lo, 1) > 1.45:
+            thr = float(np.sqrt(lo * hi))
+    gender = []
+    last = "male"
+    for f in f0s:
+        if f:
+            last = "female" if f >= thr else "male"
+            gender.append(last)
+        else:
+            gender.append(None)
+    for i, g in enumerate(gender):            # தெரியாததுக்கு பக்கத்து வசனத்தோட
+        if g is None:
+            near = [gender[j] for j in range(len(gender)) if gender[j] and abs(j - i) <= 3]
+            gender[i] = near[0] if near else "male"
+
+    spk = [None] * len(segs)
+    for g in ("male", "female"):
+        idx = [i for i in range(len(segs)) if gender[i] == g]
+        labels = {i: 0 for i in idx}
+        withmf = [i for i in idx if mfs[i] is not None]
+        if len(withmf) >= 4:
+            try:
+                from sklearn.cluster import AgglomerativeClustering
+                X = np.array([mfs[i] for i in withmf])
+                X = (X - X.mean(0)) / (X.std(0) + 1e-6)
+                cl = AgglomerativeClustering(n_clusters=None, distance_threshold=14.0,
+                                             linkage="ward").fit(X)
+                if cl.n_clusters_ > 3:
+                    cl = AgglomerativeClustering(n_clusters=3, linkage="ward").fit(X)
+                for i, lab in zip(withmf, cl.labels_):
+                    labels[i] = int(lab)
+                for i in idx:                  # MFCC இல்லாததுக்கு பக்கத்து label
+                    if mfs[i] is None:
+                        nb = [labels[j] for j in withmf if abs(j - i) <= 3]
+                        labels[i] = nb[0] if nb else 0
+            except Exception as e:
+                log("speaker clustering skip:", repr(e)[:100])
+        for i in idx:
+            spk[i] = f"{'F' if g == 'female' else 'M'}{labels[i]}"
+    for i, s in enumerate(segs):
+        s["speaker"], s["gender"] = spk[i], gender[i]
+    log("speakers:", sorted(set(spk)))
+
+
+def finalize_segs(segs, voc16):
+    """merge-க்கு அப்புறம்: pitch, சத்தம் (rms), கத்துறாரா/மெதுவா பேசுறாரான்னு."""
+    spk_f0, spk_rms = {}, {}
+    for s in segs:
+        clip = voc16[int(s["start"] * SR16):int(s["end"] * SR16)]
+        s["rms"] = float(np.sqrt(np.mean(clip ** 2))) if len(clip) else 0.0
+        spk_rms.setdefault(s["speaker"], []).append(s["rms"])
+        for f in s.get("f0s", []):
+            spk_f0.setdefault(s["speaker"], []).append(f)
+    med_f0 = {k: float(np.median(v)) for k, v in spk_f0.items()}
+    med_rms = {k: float(np.median(v)) for k, v in spk_rms.items() if len(v) >= 3}
+    for s in segs:
+        s["f0"] = float(np.median(s["f0s"])) if s.get("f0s") else med_f0.get(s["speaker"])
+        m = med_rms.get(s["speaker"])
+        s["delivery"] = None
+        if m and m > 1e-4:
+            ratio = s["rms"] / m
+            if ratio > 1.8:
+                s["delivery"] = "shouting"
+            elif ratio < 0.4:
+                s["delivery"] = "whisper"
+    return med_f0
+
+
+def build_ref(i, segs, voc, vsr, words, refdir, tag="ref"):
+    """அதே ஆளோட குரல் மட்டும் வச்சு reference (வேற ஆள் குரல் கலக்காது)."""
+    s = segs[i]
+    pieces = [(s["start"], min(s["end"], s["start"] + 10.0))]
+    dur = pieces[0][1] - pieces[0][0]
+    if dur < 2.5:
+        others = sorted((j for j in range(len(segs))
+                         if j != i and segs[j]["speaker"] == s["speaker"]),
+                        key=lambda j: abs(segs[j]["start"] - s["start"]))
+        for j in others:
+            if dur >= 4.0:
+                break
+            a, b = segs[j]["start"], min(segs[j]["end"], segs[j]["start"] + 4.0)
+            pieces.append((a, b))
+            dur += b - a
+    clips, texts = [], []
+    gap = np.zeros(int(0.12 * vsr), dtype=np.float32)
+    for a, b in pieces:
+        c = voc[int(a * vsr):int(b * vsr)]
+        if len(c):
+            clips += [c, gap]
+            t = "".join(w for (st, en, w) in words if st >= a - 0.02 and en <= b + 0.02).strip()
+            if t:
+                texts.append(t)
+    if not clips:
+        return None, None
+    clip = np.concatenate(clips)
+    if len(clip) < vsr * 0.5:
+        return None, None
+    path = os.path.join(refdir, f"{tag}_{i}.wav")
+    sf.write(path, clip, vsr)
+    return path, (" ".join(texts) or None)
+
+
+def pitch_check(wav, sr, target_f0, tol_semi=3.5):
+    """உருவாக்கின குரல் pitch, அசல் ஆளோட pitch-க்கு பக்கத்துல இருக்கான்னு (ஆண்/பெண் மாறிடுச்சான்னு)."""
+    if not target_f0:
+        return 0.0
+    f = voiced_f0(to16(wav, sr))
+    if not f:
+        return 0.0
+    return float(12 * np.log2(target_f0 / f))
+
+
+def fix_pitch(wav, sr, semi, tol_semi=3.5):
+    if abs(semi) <= tol_semi:
+        return wav
+    shift = float(np.clip(semi, -12, 12))
+    try:
+        return librosa.effects.pitch_shift(wav, sr=sr, n_steps=shift).astype(np.float32)
+    except Exception as e:
+        log("pitch shift failed:", repr(e)[:100])
+        return wav
+
+
+def trim_silence(wav, sr):
+    try:
+        w, _ = librosa.effects.trim(wav, top_db=38)
+        if len(w) > sr * 0.15:
+            wav = w
+    except Exception:
+        pass
+    f = min(int(0.01 * sr), len(wav) // 4)
+    if f > 0:
+        wav = wav.copy()
+        wav[:f] *= np.linspace(0, 1, f, dtype=np.float32)
+    return wav
+
 
 
 def merge_segments(segs, max_gap=0.7, max_dur=11.0, max_chars=260):
@@ -144,13 +333,15 @@ def merge_segments(segs, max_gap=0.7, max_dur=11.0, max_chars=260):
             p = out[-1]
             gap = s["start"] - p["end"]
             ends_sentence = p["text"].rstrip()[-1:] in ".?!…。"
-            if (gap <= max_gap and (s["end"] - p["start"]) <= max_dur
+            if (gap <= max_gap and s.get("speaker") == p.get("speaker")
+                    and (s["end"] - p["start"]) <= max_dur
                     and len(p["text"]) + len(s["text"]) + 1 <= max_chars
                     and (not ends_sentence or gap <= 0.35)):
                 p["end"] = s["end"]
                 p["text"] = p["text"].rstrip() + " " + s["text"].lstrip()
+                p["f0s"] = p.get("f0s", []) + s.get("f0s", [])
                 continue
-        out.append(dict(s))
+        out.append({**s, "f0s": list(s.get("f0s", []))})
     return out
 
 
@@ -265,7 +456,12 @@ STYLE = {
            "[emotional] 'I missed you so much.' -> 'உன்ன ரொம்ப மிஸ் பண்ணேன் டா.'\n"
            "[emotional] 'Please forgive me.' -> 'என்ன மன்னிச்சிடு, ப்ளீஸ்.'\n"
            "[serious] 'We have no time left.' -> 'நம்ம கிட்ட நேரமே இல்ல.'\n"
-           "[serious] 'They are coming for us.' -> 'அவங்க நம்மள தேடி வராங்க.'"),
+           "[serious] 'They are coming for us.' -> 'அவங்க நம்மள தேடி வராங்க.'\n"
+           "[daily] 'Did you eat?' -> 'சாப்பிட்டியா?'  'I ate.' -> 'சாப்பிட்டேன்.'\n"
+           "[daily] 'What am I doing now?' -> 'இப்போ என்ன பண்ணுறேன்?'\n"
+           "[daily] 'I have come only here.' -> 'நான் இங்கதான் வந்திருக்கேன்.'\n"
+           "Always use these casual verb forms: பண்ணுறேன்/பண்ணுற/பண்ணுறீங்க, சாப்பிட்டியா, "
+           "வர்றேன், போறேன், சொல்றேன், பார்க்குறேன். Never write செய்கிறேன்/வருகிறேன்/சாப்பிட்டாயா."),
     "te": ("Use everyday colloquial spoken Telugu (వ్యావహారిక భాష) like friends talking, "
            "not bookish/formal Telugu."),
     "ml": ("Use everyday colloquial spoken Malayalam (സംസാരഭാഷ) like friends talking, "
@@ -292,13 +488,24 @@ FLOW_RULES = (
 def _gem_prompt(items, src_lang, tgt="ta"):
     """(system instruction, user text)"""
     _, name, _, script, cps = LANGS[tgt]
-    payload = [{"id": k, "text": s_["text"],
-                "max_chars": max(10, int(s_["slot"] * cps))}
-               for k, s_ in enumerate(items)]
+    payload = []
+    for k, s_ in enumerate(items):
+        d = {"id": k, "text": s_["text"], "max_chars": max(10, int(s_["slot"] * cps))}
+        if s_.get("speaker"):
+            d["speaker"] = s_["speaker"]
+            d["speaker_gender"] = s_.get("gender")
+        if s_.get("delivery"):
+            d["delivery"] = s_["delivery"]
+        payload.append(d)
     system = (
         f"You are a professional {name} dubbing writer for films and series. Translate each line "
         f"(source language: {src_lang or 'auto'}) into {name} ({script} script) for dubbing.\n"
         + STYLE.get(tgt, "Use casual spoken style.") + "\n" + FLOW_RULES + "\n"
+        "Each input may carry 'speaker' (same id = same person) and 'speaker_gender': keep each "
+        "speaker's voice consistent and use the correct gendered forms for the SPEAKER (important in "
+        "Hindi, Telugu, Kannada, Malayalam). 'delivery': 'shouting' -> write it as a shout: short, "
+        "emphatic, ending with '!'; 'whisper' -> soft and short with '...'. Keep the original "
+        "punctuation and emotion marks (! ? …) because they control the voice's emotion.\n"
         "Rules: keep meaning and emotion; each translation MUST be at most max_chars characters "
         f"(shorten the wording if needed, never exceed it); write names in {script} script; write "
         f"numbers as {name} words; no English letters, no emojis, no explanations.\n"
@@ -307,9 +514,9 @@ def _gem_prompt(items, src_lang, tgt="ta"):
     return system, user
 
 
-def gemini_batch(items, src_lang, tgt="ta"):
+def gemini_batch(items, src_lang, tgt="ta", prompt=None):
     global _GEM_MODEL
-    system, user = _gem_prompt(items, src_lang, tgt)
+    system, user = prompt or _gem_prompt(items, src_lang, tgt)
     body = {"systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": user}]}],
             "generationConfig": {"temperature": 0.5,
@@ -359,9 +566,9 @@ _WORDS = {
     "வேண்டும்": "வேணும்", "வேண்டாம்": "வேணாம்", "இல்லை": "இல்ல", "ஆமாம்": "ஆமா",
     "என்னுடைய": "என்னோட", "உன்னுடைய": "உன்னோட", "அவருடைய": "அவரோட",
     "உங்களுடைய": "உங்களோட", "எங்களுடைய": "எங்களோட", "அவளுடைய": "அவளோட",
-    "என்ன செய்கிறாய்": "என்ன பண்ற", "என்ன செய்கிறீர்கள்": "என்ன பண்றீங்க",
-    "செய்கிறேன்": "பண்றேன்", "செய்கிறோம்": "பண்றோம்", "செய்கிறாய்": "பண்ற",
-    "செய்கிறீர்கள்": "பண்றீங்க", "செய்கிறார்கள்": "பண்றாங்க", "செய்கிறான்": "பண்றான்",
+    "என்ன செய்கிறாய்": "என்ன பண்ணுற", "என்ன செய்கிறீர்கள்": "என்ன பண்ணுறீங்க",
+    "செய்கிறேன்": "பண்ணுறேன்", "செய்கிறோம்": "பண்ணுறோம்", "செய்கிறாய்": "பண்ணுற",
+    "செய்கிறீர்கள்": "பண்ணுறீங்க", "செய்கிறார்கள்": "பண்ணுறாங்க", "செய்கிறான்": "பண்ணுறான்",
     "போகிறேன்": "போறேன்", "போகிறோம்": "போறோம்", "போகிறாய்": "போற",
     "போகிறீர்கள்": "போறீங்க", "போகிறார்கள்": "போறாங்க", "போகிறான்": "போறான்",
     "வருகிறேன்": "வரேன்", "வருகிறோம்": "வரோம்", "வருகிறாய்": "வர்ற",
@@ -392,6 +599,7 @@ def _verb_sub(m):
 
 
 _ENDINGS = [   # வினை முடிவுகள் (suffix)
+    ("ட்டாயா", "ட்டியா"), ("ந்தாயா", "ந்தியா"), ("ட்டீர்களா", "ட்டீங்களா"),
     ("ருக்கிறேன்", "ருக்கேன்"), ("ருக்கிறோம்", "ருக்கோம்"), ("ருக்கிறாய்", "ருக்க"),
     ("ருக்கிறீர்கள்", "ருக்கீங்க"), ("ருக்கிறார்கள்", "ருக்காங்க"),
     ("ருக்கிறார்", "ருக்காரு"), ("ருக்கிறாள்", "ருக்கா"), ("ருக்கிறான்", "ருக்கான்"),
@@ -409,6 +617,22 @@ def colloquial_ta(text):
         t = re.sub(a + _TA_END, b, t)
     t = _VERB_RE.sub(_verb_sub, t)
     return t
+
+
+_FORMAL_RE = re.compile(
+    "கிற(?:ேன்|ோம்|ாய்|ீர்கள்|ார்கள்|ான்|ாள்|ார்|து)|நாங்கள்|நீங்கள்|இங்கு|அங்கு|வேண்டும்|இல்லை"
+    "|அவர்கள்|மிகவும்")
+
+
+def gemini_colloquialize(lines, tgt="ta"):
+    """இன்னும் செந்தமிழ்ல இருக்கிற வரிகளை மட்டும் பேச்சு வழக்குக்கு திருப்பி எழுத (ஒரு முறை)."""
+    system = ("Rewrite each Tamil dubbing line from formal/literary Tamil into natural COLLOQUIAL spoken "
+              "Tamil (பேச்சு வழக்கு) exactly like friends talking in a Tamil film. Keep the meaning, "
+              "emotion, punctuation and roughly the same length (never longer). " + STYLE["ta"] +
+              "\nReturn ONLY a JSON array of strings, same order and count.")
+    user = "INPUT:\n" + json.dumps(lines, ensure_ascii=False)
+    items = [{"text": t, "slot": 3.0} for t in lines]
+    return gemini_batch(items, "ta", tgt, prompt=(system, user))
 
 
 def fallback_translate(text, tgt="ta"):
@@ -449,6 +673,16 @@ def translate_all(segs, src_lang, tgt="ta"):
                 time.sleep(0.5)
         if tgt == "ta":
             res = [colloquial_ta(x) for x in res]
+            bad = [k for k, x in enumerate(res) if x and _FORMAL_RE.search(x)]
+            if bad and GEMINI_KEY:
+                try:
+                    fixed = gemini_colloquialize([res[k] for k in bad], tgt)
+                    for k, t in zip(bad, fixed):
+                        if t and t.strip():
+                            res[k] = colloquial_ta(t.strip())
+                    log(f"செந்தமிழ் வரிகள் திருத்தினேன்: {len(bad)}")
+                except Exception as e:
+                    log("colloquial rewrite skip:", str(e)[:100])
         log("translated sample:", [x[:40] for x in res[:2]])
         out.extend(res)
     if not any((t or "").strip() for t in out):
@@ -491,7 +725,7 @@ def synth(text, ref_path, ref_text, duration=None, lang="ta"):
     return np.asarray(audio[0], dtype=np.float32)
 
 
-def fit_to_slot(wav, sr, slot, text, ref_path, ref_text, lang="ta"):
+def fit_to_slot(wav, sr, slot, text, ref_path, ref_text, lang="ta", target_rms=None):
     L = len(wav) / sr
     if L > slot * 1.05:
         try:
@@ -511,7 +745,10 @@ def fit_to_slot(wav, sr, slot, text, ref_path, ref_text, lang="ta"):
         wav[-f:] *= np.linspace(1, 0, f, dtype=np.float32)
     # சத்தம் சமநிலை
     rms = float(np.sqrt(np.mean(wav ** 2))) + 1e-8
-    wav = wav * min(4.0, 0.08 / rms)
+    if target_rms and target_rms > 1e-4:      # அசல் சத்தத்துக்கு ஏத்த மாதிரி (கத்தினா சத்தமா)
+        wav = wav * float(np.clip(target_rms / rms, 0.25, 4.0))
+    else:
+        wav = wav * min(4.0, 0.08 / rms)
     peak = float(np.max(np.abs(wav))) if len(wav) else 0
     if peak > 0.95:
         wav = wav * (0.95 / peak)
@@ -544,16 +781,33 @@ def pipeline(src, workdir, out_path, progress, opts):
     srt_path = os.path.join(workdir, "english.srt")
     n_subs = write_srt(english_subs(vocals, src_lang, segs), srt_path)
 
-    raw_n = len(segs)
-    segs = merge_segments(segs)          # flow-க்காக சேர்த்தல் (subtitle raw-ல இருந்து)
-    add_slots(segs, total)
-    log(f"merged for flow: {raw_n} -> {len(segs)} segments")
-
     voc, vsr = sf.read(vocals, always_2d=True)
     voc = voc.mean(axis=1).astype(np.float32)
+    voc16 = to16(voc, vsr)
+    progress("👥 யார் யார் பேசுறாங்கன்னு (ஆண்/பெண்) பாக்குறேன்...", 38)
+    try:
+        assign_speakers(segs, voc16)
+    except Exception as e:
+        log("speaker analysis failed:", repr(e)[:150])
+        for s_ in segs:
+            s_["speaker"], s_["gender"], s_["f0s"] = "M0", "male", []
+    raw_n = len(segs)
+    segs = merge_segments(segs)          # flow-க்காக சேர்த்தல் (அதே ஆள் மட்டும்)
+    med_f0 = finalize_segs(segs, voc16)
+    add_slots(segs, total)
+    log(f"merged for flow: {raw_n} -> {len(segs)} segments;",
+        "shout:", sum(1 for x in segs if x["delivery"] == "shouting"))
+
     refdir = os.path.join(workdir, "refs")
     os.makedirs(refdir, exist_ok=True)
-    refs = [make_ref(i, s, voc, vsr, words, total, refdir) for i, s in enumerate(segs)]
+    refs = [build_ref(i, segs, voc, vsr, words, refdir) for i, s in enumerate(segs)]
+    # ஒவ்வொரு ஆளுக்கும் சிறந்த (நீளமான) reference - வசனத்தோட ref தப்பா இருந்தா மாத்த
+    best = {}
+    for i, s in enumerate(segs):
+        if refs[i][0] and (s["speaker"] not in best
+                           or s["end"] - s["start"] > segs[best[s["speaker"]]]["end"] - segs[best[s["speaker"]]]["start"]):
+            best[s["speaker"]] = i
+    spk_ref = {k: build_ref(i, segs, voc, vsr, words, refdir, tag="best") for k, i in best.items()}
 
     sr = OMNI.sampling_rate
     base_path = bg if bg else audio
@@ -562,6 +816,20 @@ def pipeline(src, workdir, out_path, progress, opts):
     g = gcd(bsr, sr)
     gain = BG_GAIN if bg else 0.12
     n_seg = len(segs)
+
+    fx = None   # அசல் சிரிப்பு / அலறல் / மூச்சு / அழுகை சத்தம் (பேச்சு இல்லாத இடங்கள்ல)
+    if opts.get("fx", True) and bg:
+        mask = np.ones(len(voc), dtype=np.float32)
+        for s_ in segs:
+            mask[max(0, int((s_["start"] - 0.06) * vsr)):int((s_["end"] + 0.10) * vsr)] = 0.0
+        k = max(3, int(0.03 * vsr))
+        mask = np.convolve(mask, np.ones(k, dtype=np.float32) / k, mode="same")
+        fx_mono = voc * mask * FX_GAIN
+        g2 = gcd(bsr, vsr)
+        fx_mono = resample_poly(fx_mono, bsr // g2, vsr // g2).astype(np.float32)
+        fx = np.zeros(base.shape[0], dtype=np.float32)
+        m = min(len(fx), len(fx_mono))
+        fx[:m] = fx_mono[:m]
 
     results = []          # [{code, mix, dub, failed}]
     skipped = []
@@ -589,9 +857,22 @@ def pipeline(src, workdir, out_path, progress, opts):
                 continue
             try:
                 ref_path, ref_text = refs[i]
+                tgt_f0 = s.get("f0") or med_f0.get(s["speaker"])
+                tgt_rms = s.get("rms")
                 wav = synth(text, ref_path, ref_text, lang=code)
-                wav = fit_to_slot(wav, sr, s["slot"], text, ref_path, ref_text, lang=code)
-                a = int(s["start"] * sr)
+                semi = pitch_check(wav, sr, tgt_f0)
+                if abs(semi) > 6 and spk_ref.get(s["speaker"], (None, None))[0] not in (None, ref_path):
+                    # ஆண்/பெண் குரல் மாறிடுச்சு -> அந்த ஆளோட சிறந்த reference-ல மறுபடி
+                    br, bt = spk_ref[s["speaker"]]
+                    w2 = synth(text, br, bt, lang=code)
+                    semi2 = pitch_check(w2, sr, tgt_f0)
+                    if abs(semi2) < abs(semi):
+                        wav, semi, ref_path, ref_text = w2, semi2, br, bt
+                wav = trim_silence(wav, sr)
+                wav = fix_pitch(wav, sr, semi)
+                wav = fit_to_slot(wav, sr, s["slot"], text, ref_path, ref_text,
+                                  lang=code, target_rms=tgt_rms)
+                a = int(max(0.0, s["start"] - LEAD) * sr)
                 b = min(a + len(wav), len(track))
                 track[a:b] += wav[:b - a]
             except Exception as e:
@@ -604,6 +885,8 @@ def pipeline(src, workdir, out_path, progress, opts):
             dub = np.pad(dub, (0, n - len(dub)))
         dub = dub[:n]
         mix = base * gain + dub[:, None]
+        if fx is not None:
+            mix = mix + fx[:, None]
         peak = float(np.max(np.abs(mix)))
         if peak > 0.98:
             mix = mix * (0.98 / peak)
@@ -723,6 +1006,7 @@ def sel_markup(key, opts):
         extra_btn("குரல் மட்டும் tracks (BGM இல்லாம)", "voice"),
         extra_btn("அசல் ஆடியோ", "orig"),
         extra_btn("BGM மட்டும்", "bg"),
+        extra_btn("🎭 அசல் சிரிப்பு/அலறல்/மூச்சு சத்தம் சேர்", "fx"),
         [InlineKeyboardButton(mark(opts["doc"]) + "📄 Document (MKV)",
                               callback_data=f"sel:{key}:doc"),
          InlineKeyboardButton(mark(opts["video"]) + "🎬 Video (MP4)",
@@ -746,7 +1030,7 @@ async def handle_video(_, m: Message):
     key = f"{m.chat.id}_{m.id}"
     opts = {"langs": {c: c == "ta" for c in LANGS},
             "voice": False, "orig": False, "bg": False,
-            "doc": True, "video": False}
+            "doc": True, "video": False, "fx": True}
     PENDING[key] = {"m": m, "opts": opts}
     await m.reply_text(SEL_TEXT, reply_markup=sel_markup(key, opts), quote=True)
 
@@ -760,7 +1044,7 @@ async def on_select(_, q):
     opts = st["opts"]
     if act in LANGS:
         opts["langs"][act] = not opts["langs"][act]
-    elif act in ("voice", "orig", "bg", "doc", "video"):
+    elif act in ("voice", "orig", "bg", "doc", "video", "fx"):
         opts[act] = not opts[act]
     elif act == "go":
         if not any(opts["langs"].values()):
@@ -851,3 +1135,4 @@ if __name__ == "__main__":
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
     loop.run_until_complete(main())
+ 
