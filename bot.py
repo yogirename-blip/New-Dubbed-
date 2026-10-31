@@ -29,7 +29,15 @@ SOURCE_LANG = os.environ.get("SOURCE_LANG") or None   # ja / hi / en ... (கா
 NUM_STEP = int(os.environ.get("NUM_STEP", "32"))
 BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CHARS_PER_SEC = 11.0                                  # தமிழ் பேச்சு வேகம் (எழுத்து/வினாடி)
+CHARS_PER_SEC = 11.0                                  # பேச்சு வேகம் (எழுத்து/வினாடி)
+# code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
+LANGS = {
+    "ta": ("தமிழ்", "Tamil", "tam", "Tamil", 11.0),
+    "te": ("தெலுங்கு", "Telugu", "tel", "Telugu", 11.0),
+    "ml": ("மலையாளம்", "Malayalam", "mal", "Malayalam", 10.0),
+    "kn": ("கன்னடம்", "Kannada", "kan", "Kannada", 11.0),
+    "hi": ("ஹிந்தி", "Hindi", "hin", "Devanagari", 14.0),
+}
 
 _T0 = time.time()
 
@@ -218,25 +226,26 @@ def _gem_candidates():
     return out
 
 
-def _gem_prompt(items, src_lang):
+def _gem_prompt(items, src_lang, tgt="ta"):
+    _, name, _, script, cps = LANGS[tgt]
     payload = [{"id": k, "text": s_["text"],
-                "max_chars": max(10, int(s_["slot"] * CHARS_PER_SEC))}
+                "max_chars": max(10, int(s_["slot"] * cps))}
                for k, s_ in enumerate(items)]
     return (
-        "You are a professional Tamil dubbing writer. Translate each line "
-        f"(source language: {src_lang or 'auto'}) into natural spoken Tamil (Tamil script) "
+        f"You are a professional {name} dubbing writer. Translate each line "
+        f"(source language: {src_lang or 'auto'}) into natural spoken {name} ({script} script) "
         "for dubbing a video.\n"
         "Rules: keep meaning and emotion; casual spoken style that fits the scene; "
         "each translation MUST be at most max_chars characters (shorten the wording if "
-        "needed, never exceed it); write names in Tamil script; write numbers as Tamil "
-        "words; no English letters, no emojis, no explanations.\n"
+        f"needed, never exceed it); write names in {script} script; write numbers as "
+        f"{name} words; no English letters, no emojis, no explanations.\n"
         "Return ONLY a JSON array of strings, same order and same count as the input.\n\n"
         "INPUT:\n" + json.dumps(payload, ensure_ascii=False))
 
 
-def gemini_batch(items, src_lang):
+def gemini_batch(items, src_lang, tgt="ta"):
     global _GEM_MODEL
-    body = {"contents": [{"parts": [{"text": _gem_prompt(items, src_lang)}]}],
+    body = {"contents": [{"parts": [{"text": _gem_prompt(items, src_lang, tgt)}]}],
             "generationConfig": {"temperature": 0.3,
                                  "responseMimeType": "application/json"}}
     models = [_GEM_MODEL] if _GEM_MODEL else _gem_candidates()
@@ -274,19 +283,19 @@ def gemini_batch(items, src_lang):
     raise RuntimeError("Gemini வேலை செய்யல: " + last)
 
 
-def fallback_translate(text):
+def fallback_translate(text, tgt="ta"):
     from deep_translator import GoogleTranslator
     last = None
     for k in range(4):
         try:
-            return GoogleTranslator(source="auto", target="ta").translate(text) or ""
+            return GoogleTranslator(source="auto", target=tgt).translate(text) or ""
         except Exception as e:
             last = e
             time.sleep(2 + 3 * k)
     raise last
 
 
-def translate_all(segs, src_lang):
+def translate_all(segs, src_lang, tgt="ta"):
     out = []
     B = 25
     for i in range(0, len(segs), B):
@@ -295,7 +304,7 @@ def translate_all(segs, src_lang):
         if GEMINI_KEY:
             for attempt in range(3):
                 try:
-                    res = gemini_batch(chunk, src_lang)
+                    res = gemini_batch(chunk, src_lang, tgt)
                     break
                 except Exception as e:
                     log("Gemini retry:", str(e).replace(GEMINI_KEY, "***")[:250])
@@ -305,7 +314,7 @@ def translate_all(segs, src_lang):
             res = []
             for s_ in chunk:
                 try:
-                    res.append(fallback_translate(s_["text"]))
+                    res.append(fallback_translate(s_["text"], tgt))
                 except Exception as e2:
                     log("Google Translate failed:", repr(e2)[:150])
                     res.append("")
@@ -313,7 +322,7 @@ def translate_all(segs, src_lang):
         log("translated sample:", [x[:40] for x in res[:2]])
         out.extend(res)
     if not any((t or "").strip() for t in out):
-        raise RuntimeError("மொழிபெயர்ப்பு fail ஆச்சு, கொஞ்ச நேரம் கழித்து மறுபடி முயற்சி செய்")
+        raise RuntimeError(f"{LANGS[tgt][0]} மொழிபெயர்ப்பு fail ஆச்சு")
     return out
 
 
@@ -340,8 +349,8 @@ def make_ref(i, s, voc, vsr, words, total, refdir):
     return path, (text or None)
 
 
-def synth(text, ref_path, ref_text, duration=None):
-    kw = dict(text=text, language="ta", num_step=NUM_STEP, pad_duration=0.0)
+def synth(text, ref_path, ref_text, duration=None, lang="ta"):
+    kw = dict(text=text, language=lang, num_step=NUM_STEP, pad_duration=0.0)
     if ref_path:
         kw["ref_audio"] = ref_path
         if ref_text:
@@ -352,11 +361,11 @@ def synth(text, ref_path, ref_text, duration=None):
     return np.asarray(audio[0], dtype=np.float32)
 
 
-def fit_to_slot(wav, sr, slot, text, ref_path, ref_text):
+def fit_to_slot(wav, sr, slot, text, ref_path, ref_text, lang="ta"):
     L = len(wav) / sr
     if L > slot * 1.05:
         try:
-            w2 = synth(text, ref_path, ref_text, duration=slot)
+            w2 = synth(text, ref_path, ref_text, duration=slot, lang=lang)
             if len(w2) > 0:
                 wav = w2
         except Exception as e:
@@ -381,6 +390,7 @@ def fit_to_slot(wav, sr, slot, text, ref_path, ref_text):
 
 # ---------------------------------------------------------------- pipeline
 def pipeline(src, workdir, out_path, progress, opts):
+    langs = [c for c in LANGS if opts.get("langs", {}).get(c)] or ["ta"]
     total, width, height = probe(src)
 
     progress("🎵 ஆடியோ எடுக்கிறேன்...", 2)
@@ -395,125 +405,172 @@ def pipeline(src, workdir, out_path, progress, opts):
         vocals, bg = audio, None
 
     progress("📝 பேச்சை எழுத்தாக மாற்றுறேன்...", 25)
-    segs, words, lang = transcribe(vocals)
+    segs, words, src_lang = transcribe(vocals)
     if not segs:
         raise RuntimeError("வீடியோவில் பேச்சு எதுவும் கிடைக்கல")
     add_slots(segs, total)
-    log("whisper done:", len(segs), "segments, lang", lang)
+    log("whisper done:", len(segs), "segments, lang", src_lang)
 
     progress("💬 English subtitle தயார் பண்றேன்...", 38)
     srt_path = os.path.join(workdir, "english.srt")
-    n_subs = write_srt(english_subs(vocals, lang, segs), srt_path)
-
-    progress(f"🌐 தமிழுக்கு மொழிபெயர்க்கிறேன்... ({len(segs)} வசனம்)", 42)
-    texts = translate_all(segs, lang)
+    n_subs = write_srt(english_subs(vocals, src_lang, segs), srt_path)
 
     voc, vsr = sf.read(vocals, always_2d=True)
     voc = voc.mean(axis=1).astype(np.float32)
-
     refdir = os.path.join(workdir, "refs")
     os.makedirs(refdir, exist_ok=True)
+    refs = [make_ref(i, s, voc, vsr, words, total, refdir) for i, s in enumerate(segs)]
+
     sr = OMNI.sampling_rate
-    track = np.zeros(int((total + 2) * sr), dtype=np.float32)
-    failed = 0
-
-    for i, s in enumerate(segs):
-        progress(f"🎙️ தமிழ் குரல் உருவாக்குறேன்... {i + 1}/{len(segs)}",
-                 50 + int(40 * (i + 1) / len(segs)))
-        text = (texts[i] or "").strip()
-        if not text:
-            log(f"segment {i}: தமிழ் text காலி")
-            failed += 1
-            continue
-        try:
-            ref_path, ref_text = make_ref(i, s, voc, vsr, words, total, refdir)
-            wav = synth(text, ref_path, ref_text)
-            wav = fit_to_slot(wav, sr, s["slot"], text, ref_path, ref_text)
-            a = int(s["start"] * sr)
-            b = min(a + len(wav), len(track))
-            track[a:b] += wav[:b - a]
-        except Exception as e:
-            failed += 1
-            log(f"segment {i} failed:", repr(e))
-
-    progress("🎛️ குரலையும் BGM-ஐயும் சேர்க்கிறேன்...", 92)
     base_path = bg if bg else audio
     base, bsr = sf.read(base_path, always_2d=True)
     base = base.astype(np.float32)
     g = gcd(bsr, sr)
-    dub = resample_poly(track, bsr // g, sr // g).astype(np.float32)
-    n = base.shape[0]
-    if len(dub) < n:
-        dub = np.pad(dub, (0, n - len(dub)))
-    dub = dub[:n]
     gain = BG_GAIN if bg else 0.12
-    mix = base * gain + dub[:, None]
-    peak = float(np.max(np.abs(mix)))
-    if peak > 0.98:
-        mix = mix * (0.98 / peak)
-    mix_path = os.path.join(workdir, "mix.wav")
-    sf.write(mix_path, mix, bsr)
+    n_seg = len(segs)
 
-    progress("🎬 MKV-ஆ இணைக்கிறேன்...", 96)
-    inputs = [src, mix_path]
-    maps = ["-map", "0:v:0", "-map", "1:a:0"]
-    meta = ["-metadata:s:a:0", "language=tam", "-metadata:s:a:0", "title=Tamil Dub"]
-    tracks = ["தமிழ் டப்"]
-    aidx = 1
+    results = []          # [{code, mix, dub, failed}]
+    skipped = []
+    span = 48.0 / len(langs)
+    for li, code in enumerate(langs):
+        lname = LANGS[code][0]
+        p0 = 42 + span * li
+        progress(f"🌐 {lname} மொழிபெயர்க்கிறேன்... ({n_seg} வசனம்)", int(p0))
+        try:
+            texts = translate_all(segs, src_lang, code)
+        except Exception as e:
+            log(f"{code} translate failed:", repr(e)[:150])
+            skipped.append(code)
+            continue
 
-    def add_input(path):
-        inputs.append(path)
-        return len(inputs) - 1
+        track = np.zeros(int((total + 2) * sr), dtype=np.float32)
+        failed = 0
+        for i, s in enumerate(segs):
+            progress(f"🎙️ {lname} குரல் உருவாக்குறேன்... {i + 1}/{n_seg}",
+                     int(p0 + span * (0.1 + 0.9 * (i + 1) / n_seg)))
+            text = (texts[i] or "").strip()
+            if not text:
+                log(f"{code} segment {i}: text காலி")
+                failed += 1
+                continue
+            try:
+                ref_path, ref_text = refs[i]
+                wav = synth(text, ref_path, ref_text, lang=code)
+                wav = fit_to_slot(wav, sr, s["slot"], text, ref_path, ref_text, lang=code)
+                a = int(s["start"] * sr)
+                b = min(a + len(wav), len(track))
+                track[a:b] += wav[:b - a]
+            except Exception as e:
+                failed += 1
+                log(f"{code} segment {i} failed:", repr(e))
 
-    def audio_meta(idx, lng, title):
-        return [f"-metadata:s:a:{idx}", f"language={lng}",
-                f"-metadata:s:a:{idx}", f"title={title}"]
+        dub = resample_poly(track, bsr // g, sr // g).astype(np.float32)
+        n = base.shape[0]
+        if len(dub) < n:
+            dub = np.pad(dub, (0, n - len(dub)))
+        dub = dub[:n]
+        mix = base * gain + dub[:, None]
+        peak = float(np.max(np.abs(mix)))
+        if peak > 0.98:
+            mix = mix * (0.98 / peak)
+        mix_path = os.path.join(workdir, f"mix_{code}.wav")
+        sf.write(mix_path, mix, bsr)
+        results.append(dict(code=code, mix=mix_path, dub=dub, failed=failed))
 
-    if opts.get("voice"):
-        vpath = os.path.join(workdir, "voice_only.wav")
-        vo = dub.copy()
-        pk = float(np.max(np.abs(vo))) if len(vo) else 0.0
-        if pk > 0.98:
-            vo = vo * (0.98 / pk)
-        sf.write(vpath, vo, bsr)
-        maps += ["-map", f"{add_input(vpath)}:a:0"]
-        meta += audio_meta(aidx, "tam", "Tamil Voice Only")
-        tracks.append("தமிழ் குரல் மட்டும்")
-        aidx += 1
-    if opts.get("bg"):
-        if bg:
-            maps += ["-map", f"{add_input(bg)}:a:0"]
-            meta += audio_meta(aidx, "und", "BGM Only")
-            tracks.append("BGM மட்டும்")
+    if not results:
+        raise RuntimeError("எந்த மொழியிலும் மொழிபெயர்ப்பு நடக்கல, கொஞ்ச நேரம் கழித்து மறுபடி முயற்சி செய்")
+
+    tracks = []
+    mkv_path = None
+    if opts.get("doc"):
+        progress("🎬 MKV-ஆ இணைக்கிறேன்...", 94)
+        inputs = [src]
+        maps = ["-map", "0:v:0"]
+        meta = []
+        aidx = 0
+
+        def add_input(path):
+            inputs.append(path)
+            return len(inputs) - 1
+
+        def add_audio(path, lng, title, label):
+            nonlocal aidx
+            maps.extend(["-map", f"{add_input(path)}:a:0"])
+            meta.extend([f"-metadata:s:a:{aidx}", f"language={lng}",
+                         f"-metadata:s:a:{aidx}", f"title={title}"])
+            tracks.append(label)
             aidx += 1
-        else:
-            log("BGM track skip: demucs இல்ல")
-    if opts.get("orig"):
-        n_orig = count_audio(src)
-        for k in range(n_orig):
-            maps += ["-map", f"0:a:{k}"]
-            meta += audio_meta(aidx, "und", "Original" if n_orig == 1 else f"Original {k + 1}")
-            aidx += 1
-        if n_orig:
-            tracks.append("அசல் ஆடியோ")
-    if n_subs > 0:
-        maps += ["-map", f"{add_input(srt_path)}:0"]
-        meta += ["-c:s", "srt", "-metadata:s:s:0", "language=eng",
-                 "-metadata:s:s:0", "title=English", "-disposition:s:0", "default"]
-    disp = ["-disposition:a:0", "default"] + sum(
-        [[f"-disposition:a:{k}", "0"] for k in range(1, aidx)], [])
-    cmd = ["ffmpeg", "-y"]
-    for pth in inputs:
-        cmd += ["-i", pth]
-    try:
-        run(cmd + maps + ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"] + meta + disp + [out_path])
-    except Exception as e:
-        log("mkv copy failed, re-encode:", repr(e)[:150])
-        run(cmd + maps + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                          "-c:a", "aac", "-b:a", "192k"] + meta + disp + [out_path])
+
+        for r in results:
+            _, ename, iso, _, _ = LANGS[r["code"]]
+            add_audio(r["mix"], iso, f"{ename} Dub", LANGS[r["code"]][0])
+        if opts.get("voice"):
+            for r in results:
+                _, ename, iso, _, _ = LANGS[r["code"]]
+                vpath = os.path.join(workdir, f"voice_{r['code']}.wav")
+                vo = r["dub"]
+                pk = float(np.max(np.abs(vo))) if len(vo) else 0.0
+                if pk > 0.98:
+                    vo = vo * (0.98 / pk)
+                sf.write(vpath, vo, bsr)
+                add_audio(vpath, iso, f"{ename} Voice Only", f"{LANGS[r['code']][0]} குரல் மட்டும்")
+        if opts.get("bg"):
+            if bg:
+                add_audio(bg, "und", "BGM Only", "BGM மட்டும்")
+            else:
+                log("BGM track skip: demucs இல்ல")
+        if opts.get("orig"):
+            n_orig = count_audio(src)
+            for k in range(n_orig):
+                maps.extend(["-map", f"0:a:{k}"])
+                meta.extend([f"-metadata:s:a:{aidx}", "language=und",
+                             f"-metadata:s:a:{aidx}",
+                             f"title={'Original' if n_orig == 1 else 'Original ' + str(k + 1)}"])
+                aidx += 1
+            if n_orig:
+                tracks.append("அசல் ஆடியோ")
+        if n_subs > 0:
+            maps.extend(["-map", f"{add_input(srt_path)}:0"])
+            meta.extend(["-c:s", "srt", "-metadata:s:s:0", "language=eng",
+                         "-metadata:s:s:0", "title=English", "-disposition:s:0", "default"])
+        disp = ["-disposition:a:0", "default"]
+        for k in range(1, aidx):
+            disp += [f"-disposition:a:{k}", "0"]
+        cmd = ["ffmpeg", "-y"]
+        for pth in inputs:
+            cmd += ["-i", pth]
+        try:
+            run(cmd + maps + ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"] + meta + disp + [out_path])
+        except Exception as e:
+            log("mkv copy failed, re-encode:", repr(e)[:150])
+            run(cmd + maps + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                              "-c:a", "aac", "-b:a", "192k"] + meta + disp + [out_path])
+        mkv_path = out_path
+
+    mp4s = []
+    if opts.get("video"):
+        for k, r in enumerate(results):
+            code = r["code"]
+            progress(f"🎬 {LANGS[code][0]} MP4 தயார் பண்றேன்...", 96 + k * 3 // len(results))
+            mp4 = os.path.join(os.path.dirname(out_path), f"Dubbed_{LANGS[code][1]}.mp4")
+            base_cmd = ["ffmpeg", "-y", "-i", src, "-i", r["mix"],
+                        "-map", "0:v:0", "-map", "1:a:0"]
+            try:
+                run(base_cmd + ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                                "-movflags", "+faststart", mp4])
+            except Exception as e:
+                log("mp4 copy failed, re-encode:", repr(e)[:150])
+                run(base_cmd + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", mp4])
+            mp4s.append((code, mp4))
+            if not opts.get("doc"):
+                tracks.append(LANGS[code][0])
+
     progress("✅ முடிந்தது", 100)
 
-    return dict(lang=lang, n=len(segs), failed=failed, subs=n_subs, tracks=tracks,
+    return dict(lang=src_lang, n=n_seg, failed=sum(r["failed"] for r in results),
+                subs=n_subs, tracks=tracks, mkv=mkv_path, mp4s=mp4s,
+                skipped=[LANGS[c][0] for c in skipped],
                 duration=int(total), width=width, height=height)
 
 
@@ -530,16 +587,36 @@ TASKS = set()
 
 
 def sel_markup(key, opts):
-    def btn(label, k):
-        return [InlineKeyboardButton(("✅ " if opts[k] else "⬜ ") + label,
-                                     callback_data=f"sel:{key}:{k}")]
+    def mark(on):
+        return "✅ " if on else "⬜ "
+
+    def lang_btn(c):
+        return InlineKeyboardButton(mark(opts["langs"][c]) + LANGS[c][0],
+                                    callback_data=f"sel:{key}:{c}")
+
+    def extra_btn(label, k):
+        return [InlineKeyboardButton(mark(opts[k]) + label, callback_data=f"sel:{key}:{k}")]
+
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ தமிழ் டப் (எப்போதும் இருக்கும்)", callback_data=f"sel:{key}:fixed")],
-        btn("தமிழ் குரல் மட்டும் (BGM இல்லாம)", "voice"),
-        btn("அசல் ஆடியோ", "orig"),
-        btn("BGM மட்டும் (குரல் இல்லாம)", "bg"),
+        [lang_btn("ta"), lang_btn("te"), lang_btn("ml")],
+        [lang_btn("kn"), lang_btn("hi")],
+        extra_btn("குரல் மட்டும் tracks (BGM இல்லாம)", "voice"),
+        extra_btn("அசல் ஆடியோ", "orig"),
+        extra_btn("BGM மட்டும்", "bg"),
+        [InlineKeyboardButton(mark(opts["doc"]) + "📄 Document (MKV)",
+                              callback_data=f"sel:{key}:doc"),
+         InlineKeyboardButton(mark(opts["video"]) + "🎬 Video (MP4)",
+                              callback_data=f"sel:{key}:video")],
         [InlineKeyboardButton("▶️ தொடங்கு", callback_data=f"sel:{key}:go")],
     ])
+
+
+SEL_TEXT = ("🎧 எந்தெந்த மொழியில் டப் வேணும்? (பல மொழி தேர்வு செய்யலாம்)\n"
+            "ஒவ்வொரு மொழியும் ஒரு audio track-ஆ MKV-ல் வரும். "
+            "மொழி கூடக்கூட நேரமும் கூடும்.\n"
+            "📄 Document (MKV) = எல்லா audio + subtitle ஒரே file. "
+            "🎬 Video (MP4) = Telegram-லயே play ஆகும், ஒரு மொழிக்கு ஒரு video.\n"
+            "தேர்வு பண்ணிட்டு ▶️ தொடங்கு அழுத்து.")
 
 
 @app.on_message(filters.private & (filters.video | filters.document))
@@ -547,11 +624,11 @@ async def handle_video(_, m: Message):
     if m.document and not (m.document.mime_type or "").startswith("video/"):
         return await m.reply_text("வீடியோ கோப்பு மட்டும் அனுப்பு.")
     key = f"{m.chat.id}_{m.id}"
-    opts = {"voice": False, "orig": False, "bg": False}
+    opts = {"langs": {c: c == "ta" for c in LANGS},
+            "voice": False, "orig": False, "bg": False,
+            "doc": True, "video": False}
     PENDING[key] = {"m": m, "opts": opts}
-    await m.reply_text(
-        "🎧 எந்த ஆடியோ track-கள் MKV-ல் வேணும்?\nதேர்வு பண்ணிட்டு ▶️ தொடங்கு அழுத்து.",
-        reply_markup=sel_markup(key, opts), quote=True)
+    await m.reply_text(SEL_TEXT, reply_markup=sel_markup(key, opts), quote=True)
 
 
 @app.on_callback_query(filters.regex(r"^sel:"))
@@ -560,25 +637,34 @@ async def on_select(_, q):
     st = PENDING.get(key)
     if not st:
         return await q.answer("இந்த request காலாவதி ஆச்சு, வீடியோவை மறுபடி அனுப்பு", show_alert=True)
-    if act == "fixed":
-        return await q.answer("தமிழ் டப் எப்போதும் இருக்கும்")
-    if act in st["opts"]:
-        st["opts"][act] = not st["opts"][act]
-        await q.edit_message_reply_markup(sel_markup(key, st["opts"]))
-        return await q.answer()
-    if act == "go":
+    opts = st["opts"]
+    if act in LANGS:
+        opts["langs"][act] = not opts["langs"][act]
+    elif act in ("voice", "orig", "bg", "doc", "video"):
+        opts[act] = not opts[act]
+    elif act == "go":
+        if not any(opts["langs"].values()):
+            return await q.answer("குறைந்தது ஒரு மொழி தேர்வு பண்ணு", show_alert=True)
+        if not (opts["doc"] or opts["video"]):
+            return await q.answer("Document அல்லது Video-ல ஒண்ணு தேர்வு பண்ணு", show_alert=True)
         PENDING.pop(key, None)
         await q.answer("தொடங்குறேன்...")
         await safe_edit(q.message, "⏳ வரிசையில் இருக்கு...")
-        task = asyncio.create_task(process_video(st["m"], q.message, st["opts"]))
+        task = asyncio.create_task(process_video(st["m"], q.message, opts))
         TASKS.add(task)
         task.add_done_callback(TASKS.discard)
+        return
+    try:
+        await q.edit_message_reply_markup(sel_markup(key, opts))
+    except Exception:
+        pass
+    await q.answer()
 
 
 async def process_video(m: Message, status: Message, opts: dict):
     workdir = tempfile.mkdtemp(prefix="dub_")
     src = os.path.join(workdir, "input.mp4")
-    out = os.path.join(workdir, "Tamil_Dubbed.mkv")
+    out = os.path.join(workdir, "Dubbed.mkv")
     loop = asyncio.get_running_loop()
     last = {"t": 0.0, "txt": "", "pct": 0}
 
@@ -599,13 +685,23 @@ async def process_video(m: Message, status: Message, opts: dict):
             await m.download(file_name=src)
             info = await asyncio.to_thread(pipeline, src, workdir, out, progress, opts)
             await safe_edit(status, "▓▓▓▓▓▓▓▓▓▓ 100%\n📤 உனக்கு அனுப்புறேன்...")
-            cap = f"✅ தமிழ் டப்பிங் ரெடி!\n(மூல மொழி: {info['lang']}, {info['n']} வசனம்"
+            cap = f"✅ டப்பிங் ரெடி!\n(மூல மொழி: {info['lang']}, {info['n']} வசனம்"
             cap += f", {info['failed']} தவறியது)" if info["failed"] else ")"
             cap += "\n🎧 Audio: " + ", ".join(info["tracks"])
+            if info["skipped"]:
+                cap += "\n⚠️ தவறிய மொழி: " + ", ".join(info["skipped"])
             if info["subs"]:
                 cap += "\n💬 English subtitle உள்ளது"
-            cap += "\n(VLC / MX Player-ல் Audio & Subtitle track மாத்திக்கலாம்)"
-            await m.reply_document(out, caption=cap, force_document=True)
+            if info["mkv"]:
+                cap += "\n(VLC / MX Player-ல் Audio & Subtitle track மாத்திக்கலாம்)"
+                await m.reply_document(info["mkv"], caption=cap, force_document=True)
+            for k, (code, pth) in enumerate(info["mp4s"]):
+                vcap = f"🎬 {LANGS[code][0]} டப்"
+                if not info["mkv"] and k == 0:
+                    vcap = cap + "\n" + vcap
+                await m.reply_video(pth, caption=vcap, supports_streaming=True,
+                                    duration=info["duration"], width=info["width"],
+                                    height=info["height"])
             await status.delete()
     except Exception as e:
         await safe_edit(status, f"❌ பிழை: {str(e)[:500]}")
