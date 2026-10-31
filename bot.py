@@ -16,7 +16,7 @@ import soundfile as sf
 import torch
 from aiohttp import web
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from scipy.signal import resample_poly
 
 API_ID = int(os.environ["API_ID"])
@@ -93,6 +93,12 @@ def probe(path):
     return float(j["format"]["duration"]), int(st.get("width") or 0), int(st.get("height") or 0)
 
 
+def count_audio(path):
+    p = run(["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", path])
+    return len([x for x in p.stdout.split() if x.strip()])
+
+
 def separate(audio_path, workdir):
     """demucs: குரல் + BGM பிரிக்கும். (vocals_path, background_path) தரும்."""
     outdir = os.path.join(workdir, "sep")
@@ -131,6 +137,44 @@ def add_slots(segs, total):
         slot = min(avail, dur * 1.6 + 0.4)
         slot = max(slot, min(dur, avail))
         s["slot"] = max(0.4, slot)
+
+
+# ---------------------------------------------------------------- subtitles
+def _srt_time(t):
+    t = max(0.0, t)
+    ms = int(round(t * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    sec, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
+
+
+def english_subs(vocals_path, lang, segs):
+    """English subtitle வரிகள் [(start, end, text)]. மூலம் English இல்லன்னா whisper translate."""
+    if lang == "en":
+        return [(s["start"], s["end"], s["text"]) for s in segs]
+    try:
+        segments, _ = WHISPER.transcribe(
+            vocals_path, language=lang, task="translate", vad_filter=True,
+            beam_size=5, condition_on_previous_text=False)
+        out = []
+        for s in segments:
+            t = (s.text or "").strip()
+            if t:
+                out.append((float(s.start), float(s.end), t))
+        return out
+    except Exception as e:
+        log("English subtitle failed:", repr(e)[:150])
+        return []
+
+
+def write_srt(subs, path):
+    lines = []
+    for i, (a, b, t) in enumerate(subs, 1):
+        lines.append(f"{i}\n{_srt_time(a)} --> {_srt_time(b)}\n{t}\n")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return len(subs)
 
 
 # ---------------------------------------------------------------- translate
@@ -336,27 +380,32 @@ def fit_to_slot(wav, sr, slot, text, ref_path, ref_text):
 
 
 # ---------------------------------------------------------------- pipeline
-def pipeline(src, workdir, out_path, progress):
+def pipeline(src, workdir, out_path, progress, opts):
     total, width, height = probe(src)
 
+    progress("🎵 ஆடியோ எடுக்கிறேன்...", 2)
     audio = os.path.join(workdir, "audio.wav")
     run(["ffmpeg", "-y", "-i", src, "-vn", "-ac", "2", "-ar", "44100", audio])
 
-    progress("🎚️ குரல் / BGM பிரிக்கிறேன்...")
+    progress("🎚️ குரல் / BGM பிரிக்கிறேன்...", 5)
     try:
         vocals, bg = separate(audio, workdir)
     except Exception as e:
         log("demucs failed:", repr(e))
         vocals, bg = audio, None
 
-    progress("📝 பேச்சை எழுத்தாக மாற்றுறேன்...")
+    progress("📝 பேச்சை எழுத்தாக மாற்றுறேன்...", 25)
     segs, words, lang = transcribe(vocals)
     if not segs:
         raise RuntimeError("வீடியோவில் பேச்சு எதுவும் கிடைக்கல")
     add_slots(segs, total)
     log("whisper done:", len(segs), "segments, lang", lang)
 
-    progress(f"🌐 தமிழுக்கு மொழிபெயர்க்கிறேன்... ({len(segs)} வசனம்)")
+    progress("💬 English subtitle தயார் பண்றேன்...", 38)
+    srt_path = os.path.join(workdir, "english.srt")
+    n_subs = write_srt(english_subs(vocals, lang, segs), srt_path)
+
+    progress(f"🌐 தமிழுக்கு மொழிபெயர்க்கிறேன்... ({len(segs)} வசனம்)", 42)
     texts = translate_all(segs, lang)
 
     voc, vsr = sf.read(vocals, always_2d=True)
@@ -369,7 +418,8 @@ def pipeline(src, workdir, out_path, progress):
     failed = 0
 
     for i, s in enumerate(segs):
-        progress(f"🎙️ தமிழ் குரல் உருவாக்குறேன்... {i + 1}/{len(segs)}")
+        progress(f"🎙️ தமிழ் குரல் உருவாக்குறேன்... {i + 1}/{len(segs)}",
+                 50 + int(40 * (i + 1) / len(segs)))
         text = (texts[i] or "").strip()
         if not text:
             log(f"segment {i}: தமிழ் text காலி")
@@ -386,7 +436,7 @@ def pipeline(src, workdir, out_path, progress):
             failed += 1
             log(f"segment {i} failed:", repr(e))
 
-    progress("🎛️ குரலையும் BGM-ஐயும் சேர்க்கிறேன்...")
+    progress("🎛️ குரலையும் BGM-ஐயும் சேர்க்கிறேன்...", 92)
     base_path = bg if bg else audio
     base, bsr = sf.read(base_path, always_2d=True)
     base = base.astype(np.float32)
@@ -404,17 +454,66 @@ def pipeline(src, workdir, out_path, progress):
     mix_path = os.path.join(workdir, "mix.wav")
     sf.write(mix_path, mix, bsr)
 
-    progress("🎬 வீடியோவோடு இணைக்கிறேன்...")
-    try:
-        run(["ffmpeg", "-y", "-i", src, "-i", mix_path, "-map", "0:v:0", "-map", "1:a:0",
-             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-             "-movflags", "+faststart", out_path])
-    except Exception:
-        run(["ffmpeg", "-y", "-i", src, "-i", mix_path, "-map", "0:v:0", "-map", "1:a:0",
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-             "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out_path])
+    progress("🎬 MKV-ஆ இணைக்கிறேன்...", 96)
+    inputs = [src, mix_path]
+    maps = ["-map", "0:v:0", "-map", "1:a:0"]
+    meta = ["-metadata:s:a:0", "language=tam", "-metadata:s:a:0", "title=Tamil Dub"]
+    tracks = ["தமிழ் டப்"]
+    aidx = 1
 
-    return dict(lang=lang, n=len(segs), failed=failed,
+    def add_input(path):
+        inputs.append(path)
+        return len(inputs) - 1
+
+    def audio_meta(idx, lng, title):
+        return [f"-metadata:s:a:{idx}", f"language={lng}",
+                f"-metadata:s:a:{idx}", f"title={title}"]
+
+    if opts.get("voice"):
+        vpath = os.path.join(workdir, "voice_only.wav")
+        vo = dub.copy()
+        pk = float(np.max(np.abs(vo))) if len(vo) else 0.0
+        if pk > 0.98:
+            vo = vo * (0.98 / pk)
+        sf.write(vpath, vo, bsr)
+        maps += ["-map", f"{add_input(vpath)}:a:0"]
+        meta += audio_meta(aidx, "tam", "Tamil Voice Only")
+        tracks.append("தமிழ் குரல் மட்டும்")
+        aidx += 1
+    if opts.get("bg"):
+        if bg:
+            maps += ["-map", f"{add_input(bg)}:a:0"]
+            meta += audio_meta(aidx, "und", "BGM Only")
+            tracks.append("BGM மட்டும்")
+            aidx += 1
+        else:
+            log("BGM track skip: demucs இல்ல")
+    if opts.get("orig"):
+        n_orig = count_audio(src)
+        for k in range(n_orig):
+            maps += ["-map", f"0:a:{k}"]
+            meta += audio_meta(aidx, "und", "Original" if n_orig == 1 else f"Original {k + 1}")
+            aidx += 1
+        if n_orig:
+            tracks.append("அசல் ஆடியோ")
+    if n_subs > 0:
+        maps += ["-map", f"{add_input(srt_path)}:0"]
+        meta += ["-c:s", "srt", "-metadata:s:s:0", "language=eng",
+                 "-metadata:s:s:0", "title=English", "-disposition:s:0", "default"]
+    disp = ["-disposition:a:0", "default"] + sum(
+        [[f"-disposition:a:{k}", "0"] for k in range(1, aidx)], [])
+    cmd = ["ffmpeg", "-y"]
+    for pth in inputs:
+        cmd += ["-i", pth]
+    try:
+        run(cmd + maps + ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"] + meta + disp + [out_path])
+    except Exception as e:
+        log("mkv copy failed, re-encode:", repr(e)[:150])
+        run(cmd + maps + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                          "-c:a", "aac", "-b:a", "192k"] + meta + disp + [out_path])
+    progress("✅ முடிந்தது", 100)
+
+    return dict(lang=lang, n=len(segs), failed=failed, subs=n_subs, tracks=tracks,
                 duration=int(total), width=width, height=height)
 
 
@@ -426,36 +525,87 @@ async def start_cmd(_, m: Message):
         "தமிழ் டப்பிங் பண்ணி தருகிறேன்.\nநேரம் ஆகலாம், பொறுமையா காத்திரு.")
 
 
+PENDING = {}
+TASKS = set()
+
+
+def sel_markup(key, opts):
+    def btn(label, k):
+        return [InlineKeyboardButton(("✅ " if opts[k] else "⬜ ") + label,
+                                     callback_data=f"sel:{key}:{k}")]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ தமிழ் டப் (எப்போதும் இருக்கும்)", callback_data=f"sel:{key}:fixed")],
+        btn("தமிழ் குரல் மட்டும் (BGM இல்லாம)", "voice"),
+        btn("அசல் ஆடியோ", "orig"),
+        btn("BGM மட்டும் (குரல் இல்லாம)", "bg"),
+        [InlineKeyboardButton("▶️ தொடங்கு", callback_data=f"sel:{key}:go")],
+    ])
+
+
 @app.on_message(filters.private & (filters.video | filters.document))
 async def handle_video(_, m: Message):
     if m.document and not (m.document.mime_type or "").startswith("video/"):
         return await m.reply_text("வீடியோ கோப்பு மட்டும் அனுப்பு.")
+    key = f"{m.chat.id}_{m.id}"
+    opts = {"voice": False, "orig": False, "bg": False}
+    PENDING[key] = {"m": m, "opts": opts}
+    await m.reply_text(
+        "🎧 எந்த ஆடியோ track-கள் MKV-ல் வேணும்?\nதேர்வு பண்ணிட்டு ▶️ தொடங்கு அழுத்து.",
+        reply_markup=sel_markup(key, opts), quote=True)
 
-    status = await m.reply_text("⏳ வரிசையில் இருக்கு...")
+
+@app.on_callback_query(filters.regex(r"^sel:"))
+async def on_select(_, q):
+    _, key, act = q.data.split(":")
+    st = PENDING.get(key)
+    if not st:
+        return await q.answer("இந்த request காலாவதி ஆச்சு, வீடியோவை மறுபடி அனுப்பு", show_alert=True)
+    if act == "fixed":
+        return await q.answer("தமிழ் டப் எப்போதும் இருக்கும்")
+    if act in st["opts"]:
+        st["opts"][act] = not st["opts"][act]
+        await q.edit_message_reply_markup(sel_markup(key, st["opts"]))
+        return await q.answer()
+    if act == "go":
+        PENDING.pop(key, None)
+        await q.answer("தொடங்குறேன்...")
+        await safe_edit(q.message, "⏳ வரிசையில் இருக்கு...")
+        task = asyncio.create_task(process_video(st["m"], q.message, st["opts"]))
+        TASKS.add(task)
+        task.add_done_callback(TASKS.discard)
+
+
+async def process_video(m: Message, status: Message, opts: dict):
     workdir = tempfile.mkdtemp(prefix="dub_")
     src = os.path.join(workdir, "input.mp4")
-    out = os.path.join(workdir, "tamil.mp4")
+    out = os.path.join(workdir, "Tamil_Dubbed.mkv")
     loop = asyncio.get_running_loop()
-    last = {"t": 0.0, "txt": ""}
+    last = {"t": 0.0, "txt": "", "pct": 0}
 
-    def progress(text):
-        log(text)
+    def progress(text, pct=None):
+        log(text, f"{pct}%" if pct is not None else "")
+        if pct is not None:
+            last["pct"] = pct
+        p = last["pct"]
+        msg = f"{'▓' * (p // 10)}{'░' * (10 - p // 10)} {p}%\n{text}"
         now = time.time()
-        if text != last["txt"] and now - last["t"] > 3:
-            last["t"], last["txt"] = now, text
-            asyncio.run_coroutine_threadsafe(safe_edit(status, text), loop)
+        if msg != last["txt"] and (now - last["t"] > 3 or p >= 100):
+            last["t"], last["txt"] = now, msg
+            asyncio.run_coroutine_threadsafe(safe_edit(status, msg), loop)
 
     try:
         async with queue_lock:
-            await safe_edit(status, "📥 வீடியோ எடுக்கிறேன்...")
+            await safe_edit(status, "░░░░░░░░░░ 0%\n📥 வீடியோ எடுக்கிறேன்...")
             await m.download(file_name=src)
-            info = await asyncio.to_thread(pipeline, src, workdir, out, progress)
-            await safe_edit(status, "📤 உனக்கு அனுப்புறேன்...")
+            info = await asyncio.to_thread(pipeline, src, workdir, out, progress, opts)
+            await safe_edit(status, "▓▓▓▓▓▓▓▓▓▓ 100%\n📤 உனக்கு அனுப்புறேன்...")
             cap = f"✅ தமிழ் டப்பிங் ரெடி!\n(மூல மொழி: {info['lang']}, {info['n']} வசனம்"
             cap += f", {info['failed']} தவறியது)" if info["failed"] else ")"
-            await m.reply_video(out, caption=cap, supports_streaming=True,
-                                duration=info["duration"], width=info["width"],
-                                height=info["height"])
+            cap += "\n🎧 Audio: " + ", ".join(info["tracks"])
+            if info["subs"]:
+                cap += "\n💬 English subtitle உள்ளது"
+            cap += "\n(VLC / MX Player-ல் Audio & Subtitle track மாத்திக்கலாம்)"
+            await m.reply_document(out, caption=cap, force_document=True)
             await status.delete()
     except Exception as e:
         await safe_edit(status, f"❌ பிழை: {str(e)[:500]}")
