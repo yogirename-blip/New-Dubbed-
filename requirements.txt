@@ -2,3 +2,11 @@ pyrofork
 tgcrypto
 httpx
 aiohttp
+numpy
+scipy
+soundfile
+librosa
+deep-translator
+faster-whisper
+demucs
+omnivoice
