@@ -480,96 +480,82 @@ def pipeline(src, workdir, out_path, progress, opts):
     if not results:
         raise RuntimeError("எந்த மொழியிலும் மொழிபெயர்ப்பு நடக்கல, கொஞ்ச நேரம் கழித்து மறுபடி முயற்சி செய்")
 
-    tracks = []
-    mkv_path = None
-    if opts.get("doc"):
-        progress("🎬 MKV-ஆ இணைக்கிறேன்...", 94)
+    # எல்லா மொழி / extra audio tracks இங்க சேரும் -> MKV, MP4 ரெண்டுலயும் ஒரே மாதிரி
+    audio_items = []      # (path, iso, title, label)
+    for r in results:
+        lname, ename, iso, _, _ = LANGS[r["code"]]
+        audio_items.append((r["mix"], iso, f"{ename} Dub", lname))
+    if opts.get("voice"):
+        for r in results:
+            lname, ename, iso, _, _ = LANGS[r["code"]]
+            vpath = os.path.join(workdir, f"voice_{r['code']}.wav")
+            vo = r["dub"]
+            pk = float(np.max(np.abs(vo))) if len(vo) else 0.0
+            if pk > 0.98:
+                vo = vo * (0.98 / pk)
+            sf.write(vpath, vo, bsr)
+            audio_items.append((vpath, iso, f"{ename} Voice Only", f"{lname} குரல் மட்டும்"))
+    if opts.get("bg"):
+        if bg:
+            audio_items.append((bg, "und", "BGM Only", "BGM மட்டும்"))
+        else:
+            log("BGM track skip: demucs இல்ல")
+    n_orig = count_audio(src) if opts.get("orig") else 0
+    tracks = [it[3] for it in audio_items] + (["அசல் ஆடியோ"] if n_orig else [])
+
+    def build(path, sub_codec):
         inputs = [src]
         maps = ["-map", "0:v:0"]
         meta = []
         aidx = 0
-
-        def add_input(path):
-            inputs.append(path)
-            return len(inputs) - 1
-
-        def add_audio(path, lng, title, label):
-            nonlocal aidx
-            maps.extend(["-map", f"{add_input(path)}:a:0"])
-            meta.extend([f"-metadata:s:a:{aidx}", f"language={lng}",
-                         f"-metadata:s:a:{aidx}", f"title={title}"])
-            tracks.append(label)
+        for apath, lng, title, _ in audio_items:
+            inputs.append(apath)
+            maps += ["-map", f"{len(inputs) - 1}:a:0"]
+            meta += [f"-metadata:s:a:{aidx}", f"language={lng}",
+                     f"-metadata:s:a:{aidx}", f"title={title}"]
             aidx += 1
-
-        for r in results:
-            _, ename, iso, _, _ = LANGS[r["code"]]
-            add_audio(r["mix"], iso, f"{ename} Dub", LANGS[r["code"]][0])
-        if opts.get("voice"):
-            for r in results:
-                _, ename, iso, _, _ = LANGS[r["code"]]
-                vpath = os.path.join(workdir, f"voice_{r['code']}.wav")
-                vo = r["dub"]
-                pk = float(np.max(np.abs(vo))) if len(vo) else 0.0
-                if pk > 0.98:
-                    vo = vo * (0.98 / pk)
-                sf.write(vpath, vo, bsr)
-                add_audio(vpath, iso, f"{ename} Voice Only", f"{LANGS[r['code']][0]} குரல் மட்டும்")
-        if opts.get("bg"):
-            if bg:
-                add_audio(bg, "und", "BGM Only", "BGM மட்டும்")
-            else:
-                log("BGM track skip: demucs இல்ல")
-        if opts.get("orig"):
-            n_orig = count_audio(src)
-            for k in range(n_orig):
-                maps.extend(["-map", f"0:a:{k}"])
-                meta.extend([f"-metadata:s:a:{aidx}", "language=und",
-                             f"-metadata:s:a:{aidx}",
-                             f"title={'Original' if n_orig == 1 else 'Original ' + str(k + 1)}"])
-                aidx += 1
-            if n_orig:
-                tracks.append("அசல் ஆடியோ")
+        for k in range(n_orig):
+            maps += ["-map", f"0:a:{k}"]
+            meta += [f"-metadata:s:a:{aidx}", "language=und",
+                     f"-metadata:s:a:{aidx}",
+                     f"title={'Original' if n_orig == 1 else 'Original ' + str(k + 1)}"]
+            aidx += 1
         if n_subs > 0:
-            maps.extend(["-map", f"{add_input(srt_path)}:0"])
-            meta.extend(["-c:s", "srt", "-metadata:s:s:0", "language=eng",
-                         "-metadata:s:s:0", "title=English", "-disposition:s:0", "default"])
+            inputs.append(srt_path)
+            maps += ["-map", f"{len(inputs) - 1}:0"]
+            meta += ["-c:s", sub_codec, "-metadata:s:s:0", "language=eng",
+                     "-metadata:s:s:0", "title=English", "-disposition:s:0", "default"]
         disp = ["-disposition:a:0", "default"]
         for k in range(1, aidx):
             disp += [f"-disposition:a:{k}", "0"]
         cmd = ["ffmpeg", "-y"]
         for pth in inputs:
             cmd += ["-i", pth]
+        extra = ["-movflags", "+faststart"] if path.endswith(".mp4") else []
         try:
-            run(cmd + maps + ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"] + meta + disp + [out_path])
+            run(cmd + maps + ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]
+                + meta + disp + extra + [path])
         except Exception as e:
-            log("mkv copy failed, re-encode:", repr(e)[:150])
+            log(f"{os.path.basename(path)} copy failed, re-encode:", repr(e)[:150])
             run(cmd + maps + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                              "-c:a", "aac", "-b:a", "192k"] + meta + disp + [out_path])
+                              "-c:a", "aac", "-b:a", "192k"] + meta + disp + extra + [path])
+
+    mkv_path = None
+    if opts.get("doc"):
+        progress("🎬 MKV-ஆ இணைக்கிறேன்...", 94)
+        build(out_path, "srt")
         mkv_path = out_path
 
-    mp4s = []
+    mp4_path = None
     if opts.get("video"):
-        for k, r in enumerate(results):
-            code = r["code"]
-            progress(f"🎬 {LANGS[code][0]} MP4 தயார் பண்றேன்...", 96 + k * 3 // len(results))
-            mp4 = os.path.join(os.path.dirname(out_path), f"Dubbed_{LANGS[code][1]}.mp4")
-            base_cmd = ["ffmpeg", "-y", "-i", src, "-i", r["mix"],
-                        "-map", "0:v:0", "-map", "1:a:0"]
-            try:
-                run(base_cmd + ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                                "-movflags", "+faststart", mp4])
-            except Exception as e:
-                log("mp4 copy failed, re-encode:", repr(e)[:150])
-                run(base_cmd + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", mp4])
-            mp4s.append((code, mp4))
-            if not opts.get("doc"):
-                tracks.append(LANGS[code][0])
+        progress("🎬 MP4-ஆ இணைக்கிறேன்...", 97)
+        mp4_path = os.path.join(os.path.dirname(out_path), "Dubbed_AllAudio.mp4")
+        build(mp4_path, "mov_text")
 
     progress("✅ முடிந்தது", 100)
 
     return dict(lang=src_lang, n=n_seg, failed=sum(r["failed"] for r in results),
-                subs=n_subs, tracks=tracks, mkv=mkv_path, mp4s=mp4s,
+                subs=n_subs, tracks=tracks, mkv=mkv_path, mp4=mp4_path,
                 skipped=[LANGS[c][0] for c in skipped],
                 duration=int(total), width=width, height=height)
 
@@ -615,7 +601,7 @@ SEL_TEXT = ("🎧 எந்தெந்த மொழியில் டப் �
             "ஒவ்வொரு மொழியும் ஒரு audio track-ஆ MKV-ல் வரும். "
             "மொழி கூடக்கூட நேரமும் கூடும்.\n"
             "📄 Document (MKV) = எல்லா audio + subtitle ஒரே file. "
-            "🎬 Video (MP4) = Telegram-லயே play ஆகும், ஒரு மொழிக்கு ஒரு video.\n"
+            "🎬 Video (MP4) = Telegram-ல video-வா வரும். ரெண்டுலயும் எல்லா மொழி audio-வும் ஒரே file-க்குள்ள இருக்கும்.\n"
             "தேர்வு பண்ணிட்டு ▶️ தொடங்கு அழுத்து.")
 
 
@@ -693,13 +679,12 @@ async def process_video(m: Message, status: Message, opts: dict):
             if info["subs"]:
                 cap += "\n💬 English subtitle உள்ளது"
             if info["mkv"]:
-                cap += "\n(VLC / MX Player-ல் Audio & Subtitle track மாத்திக்கலாம்)"
-                await m.reply_document(info["mkv"], caption=cap, force_document=True)
-            for k, (code, pth) in enumerate(info["mp4s"]):
-                vcap = f"🎬 {LANGS[code][0]} டப்"
-                if not info["mkv"] and k == 0:
-                    vcap = cap + "\n" + vcap
-                await m.reply_video(pth, caption=vcap, supports_streaming=True,
+                cap_mkv = cap + "\n(VLC / MX Player-ல் Audio & Subtitle track மாத்திக்கலாம்)"
+                await m.reply_document(info["mkv"], caption=cap_mkv, force_document=True)
+            if info["mp4"]:
+                cap_mp4 = cap if not info["mkv"] else "🎬 அதே video, MP4 format-ல்"
+                cap_mp4 += "\n(Telegram-ல் முதல் மொழி கேட்கும்; பதிவிறக்கி MX / VLC-ல் Audio மாத்திக்கலாம்)"
+                await m.reply_video(info["mp4"], caption=cap_mp4, supports_streaming=True,
                                     duration=info["duration"], width=info["width"],
                                     height=info["height"])
             await status.delete()
