@@ -930,7 +930,7 @@ def pipeline(src, workdir, out_path, progress, opts):
             mix = mix * (0.98 / peak)
         mix_path = os.path.join(workdir, f"mix_{code}.wav")
         sf.write(mix_path, mix, bsr)
-        results.append(dict(code=code, mix=mix_path, dub=dub, failed=failed))
+        results.append(dict(code=code, mix=mix_path, dub=dub, failed=failed, texts=texts))
 
     if not results:
         raise RuntimeError("எந்த மொழியிலும் மொழிபெயர்ப்பு நடக்கல, கொஞ்ச நேரம் கழித்து மறுபடி முயற்சி செய்")
@@ -1012,6 +1012,7 @@ def pipeline(src, workdir, out_path, progress, opts):
     return dict(lang=src_lang, n=n_seg, failed=sum(r["failed"] for r in results),
                 subs=n_subs, tracks=tracks, mkv=mkv_path, mp4=mp4_path,
                 skipped=[LANGS[c][0] for c in skipped],
+                samples={r["code"]: [t for t in r["texts"] if t][:8] for r in results},
                 duration=int(total), width=width, height=height)
 
 
@@ -1143,6 +1144,16 @@ async def process_video(m: Message, status: Message, opts: dict):
                 await m.reply_video(info["mp4"], caption=cap_mp4, supports_streaming=True,
                                     duration=info["duration"], width=info["width"],
                                     height=info["height"])
+            try:
+                lines = []
+                for code, arr in info["samples"].items():
+                    lines.append(f"📝 {LANGS[code][0]} வசனங்கள் (மாதிரி):")
+                    lines += [f"{k + 1}. {t}" for k, t in enumerate(arr)]
+                    lines.append("")
+                if lines:
+                    await m.reply_text("\n".join(lines)[:3800])
+            except Exception as e:
+                log("samples send failed:", repr(e)[:100])
             await status.delete()
     except Exception as e:
         await safe_edit(status, f"❌ பிழை: {str(e)[:500]}")
