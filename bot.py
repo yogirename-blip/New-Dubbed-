@@ -31,6 +31,13 @@ BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHARS_PER_SEC = 11.0                                  # தமிழ் பேச்சு வேகம் (எழுத்து/வினாடி)
 
+_T0 = time.time()
+
+
+def log(*a):
+    print(f"[{time.time() - _T0:7.1f}s]", *a, flush=True)
+
+
 queue_lock = asyncio.Semaphore(1)
 app = Client("tamil_dub_bot", api_id=API_ID, api_hash=API_HASH,
              bot_token=BOT_TOKEN, in_memory=True)
@@ -50,7 +57,7 @@ def load_models():
             raise RuntimeError("GPU இல்ல")
         WHISPER = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
     except Exception as e:
-        print("Whisper GPU load failed, CPU-க்கு மாறுறேன்:", e)
+        log("Whisper GPU load failed, CPU-க்கு மாறுறேன்:", e)
         WHISPER = WhisperModel("small", device="cpu", compute_type="int8")
 
     if DEVICE == "cuda":
@@ -59,7 +66,7 @@ def load_models():
     else:
         OMNI = OmniVoice.from_pretrained("k2-fsa/OmniVoice", device_map="cpu",
                                          dtype=torch.float32)
-    print("Models loaded on", DEVICE)
+    log("Models loaded on", DEVICE)
 
 
 # ---------------------------------------------------------------- helpers
@@ -127,11 +134,51 @@ def add_slots(segs, total):
 
 
 # ---------------------------------------------------------------- translate
-def gemini_batch(items, src_lang, model):
-    payload = [{"id": k, "text": s["text"],
-                "max_chars": max(10, int(s["slot"] * CHARS_PER_SEC))}
-               for k, s in enumerate(items)]
-    prompt = (
+_GEM_MODEL = None
+_GEM_BASE = "https://generativelanguage.googleapis.com/v1beta"
+_SKIP_CODES = (400, 404, 429, 500, 502, 503, 504)   # இந்த model வேண்டாம், அடுத்ததை try செய்
+
+
+def _gem_headers():
+    return {"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"}
+
+
+def _gem_candidates():
+    """env model -> சில known models -> API-ல் இருக்கும் flash models."""
+    names = []
+    if os.environ.get("GEMINI_MODEL"):
+        names.append(os.environ["GEMINI_MODEL"])
+    names += ["gemini-flash-latest", "gemini-2.5-flash",
+              "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+    try:
+        r = httpx.get(f"{_GEM_BASE}/models", headers=_gem_headers(),
+                      params={"pageSize": 200}, timeout=60)
+        r.raise_for_status()
+        listed = []
+        for m in r.json().get("models", []):
+            n = m.get("name", "").replace("models/", "")
+            if ("generateContent" in m.get("supportedGenerationMethods", [])
+                    and "flash" in n
+                    and not any(x in n for x in ("image", "tts", "live", "audio",
+                                                 "embedding", "robotics", "thinking"))):
+                listed.append(n)
+        names += sorted(listed, reverse=True)
+        log("Gemini models available:", listed[:8])
+    except Exception as e:
+        log("Gemini model list failed:", str(e)[:150])
+    seen, out = set(), []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _gem_prompt(items, src_lang):
+    payload = [{"id": k, "text": s_["text"],
+                "max_chars": max(10, int(s_["slot"] * CHARS_PER_SEC))}
+               for k, s_ in enumerate(items)]
+    return (
         "You are a professional Tamil dubbing writer. Translate each line "
         f"(source language: {src_lang or 'auto'}) into natural spoken Tamil (Tamil script) "
         "for dubbing a video.\n"
@@ -141,35 +188,58 @@ def gemini_batch(items, src_lang, model):
         "words; no English letters, no emojis, no explanations.\n"
         "Return ONLY a JSON array of strings, same order and same count as the input.\n\n"
         "INPUT:\n" + json.dumps(payload, ensure_ascii=False))
-    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{model}:generateContent?key={GEMINI_KEY}")
-    body = {"contents": [{"parts": [{"text": prompt}]}],
+
+
+def gemini_batch(items, src_lang):
+    global _GEM_MODEL
+    body = {"contents": [{"parts": [{"text": _gem_prompt(items, src_lang)}]}],
             "generationConfig": {"temperature": 0.3,
                                  "responseMimeType": "application/json"}}
-    r = httpx.post(url, json=body, timeout=60)
-    r.raise_for_status()
-    txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    txt = re.sub(r"^```(?:json)?|```$", "", txt.strip(), flags=re.M).strip()
-    arr = json.loads(txt)
-    if not isinstance(arr, list) or len(arr) != len(items):
-        raise ValueError("Gemini count mismatch")
-    return [str(x).strip() for x in arr]
-
-
-GEMINI_MODELS = list(dict.fromkeys(
-    [GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-flash-latest",
-     "gemini-3-flash-preview"]))
+    models = [_GEM_MODEL] if _GEM_MODEL else _gem_candidates()
+    last = "model இல்ல"
+    for m in models:
+        try:
+            r = httpx.post(f"{_GEM_BASE}/models/{m}:generateContent",
+                           headers=_gem_headers(), json=body, timeout=90)
+        except httpx.HTTPError as e:           # timeout / network
+            last = f"{m}: {type(e).__name__}"
+            log("Gemini skip", last)
+            _GEM_MODEL = None
+            continue
+        if r.status_code in _SKIP_CODES:
+            last = f"{m}: HTTP {r.status_code} {r.text[:100]}"
+            log("Gemini skip", last)
+            _GEM_MODEL = None
+            continue
+        if r.status_code != 200:
+            raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:200]}")
+        try:
+            txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            txt = re.sub(r"^```(?:json)?|```$", "", txt.strip(), flags=re.M).strip()
+            arr = json.loads(txt)
+            if not isinstance(arr, list) or len(arr) != len(items):
+                raise ValueError("Gemini count mismatch")
+        except Exception as e:
+            last = f"{m}: {str(e)[:100]}"
+            log("Gemini bad reply", last)
+            _GEM_MODEL = None
+            continue
+        _GEM_MODEL = m
+        log("Gemini model:", m)
+        return [str(x).strip() for x in arr]
+    raise RuntimeError("Gemini வேலை செய்யல: " + last)
 
 
 def fallback_translate(text):
     from deep_translator import GoogleTranslator
-    for a in range(3):
+    last = None
+    for k in range(4):
         try:
             return GoogleTranslator(source="auto", target="ta").translate(text) or ""
         except Exception as e:
-            print("GT retry:", str(e)[:100])
-            time.sleep(4 + a * 6)
-    return ""
+            last = e
+            time.sleep(2 + 3 * k)
+    raise last
 
 
 def translate_all(segs, src_lang):
@@ -179,21 +249,24 @@ def translate_all(segs, src_lang):
         chunk = segs[i:i + B]
         res = None
         if GEMINI_KEY:
-            for model in GEMINI_MODELS:
-                for attempt in range(2):
-                    try:
-                        res = gemini_batch(chunk, src_lang, model)
-                        break
-                    except Exception as e:
-                        print(f"Gemini {model} retry:", str(e)[:120])
-                        time.sleep(3 + attempt * 4)
-                if res is not None:
+            for attempt in range(3):
+                try:
+                    res = gemini_batch(chunk, src_lang)
                     break
+                except Exception as e:
+                    log("Gemini retry:", str(e).replace(GEMINI_KEY, "***")[:250])
+                    time.sleep(2 + attempt * 3)
         if res is None:
+            log("Google Translate fallback பயன்படுத்துறேன்")
             res = []
-            for s in chunk:
-                res.append(fallback_translate(s["text"]))
-                time.sleep(1.5)
+            for s_ in chunk:
+                try:
+                    res.append(fallback_translate(s_["text"]))
+                except Exception as e2:
+                    log("Google Translate failed:", repr(e2)[:150])
+                    res.append("")
+                time.sleep(0.5)
+        log("translated sample:", [x[:40] for x in res[:2]])
         out.extend(res)
     if not any((t or "").strip() for t in out):
         raise RuntimeError("மொழிபெயர்ப்பு fail ஆச்சு, கொஞ்ச நேரம் கழித்து மறுபடி முயற்சி செய்")
@@ -243,7 +316,7 @@ def fit_to_slot(wav, sr, slot, text, ref_path, ref_text):
             if len(w2) > 0:
                 wav = w2
         except Exception as e:
-            print("duration regen failed:", e)
+            log("duration regen failed:", repr(e))
         L = len(wav) / sr
         if L > slot:
             rate = min(L / slot, 1.35)
@@ -273,7 +346,7 @@ def pipeline(src, workdir, out_path, progress):
     try:
         vocals, bg = separate(audio, workdir)
     except Exception as e:
-        print("demucs failed:", e)
+        log("demucs failed:", repr(e))
         vocals, bg = audio, None
 
     progress("📝 பேச்சை எழுத்தாக மாற்றுறேன்...")
@@ -281,6 +354,7 @@ def pipeline(src, workdir, out_path, progress):
     if not segs:
         raise RuntimeError("வீடியோவில் பேச்சு எதுவும் கிடைக்கல")
     add_slots(segs, total)
+    log("whisper done:", len(segs), "segments, lang", lang)
 
     progress(f"🌐 தமிழுக்கு மொழிபெயர்க்கிறேன்... ({len(segs)} வசனம்)")
     texts = translate_all(segs, lang)
@@ -298,6 +372,7 @@ def pipeline(src, workdir, out_path, progress):
         progress(f"🎙️ தமிழ் குரல் உருவாக்குறேன்... {i + 1}/{len(segs)}")
         text = (texts[i] or "").strip()
         if not text:
+            log(f"segment {i}: தமிழ் text காலி")
             failed += 1
             continue
         try:
@@ -309,7 +384,7 @@ def pipeline(src, workdir, out_path, progress):
             track[a:b] += wav[:b - a]
         except Exception as e:
             failed += 1
-            print(f"segment {i} failed:", e)
+            log(f"segment {i} failed:", repr(e))
 
     progress("🎛️ குரலையும் BGM-ஐயும் சேர்க்கிறேன்...")
     base_path = bg if bg else audio
@@ -364,6 +439,7 @@ async def handle_video(_, m: Message):
     last = {"t": 0.0, "txt": ""}
 
     def progress(text):
+        log(text)
         now = time.time()
         if text != last["txt"] and now - last["t"] > 3:
             last["t"], last["txt"] = now, text
@@ -399,7 +475,7 @@ async def main():
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080))).start()
     await app.start()
-    print("Bot started")
+    log("Bot started")
     await asyncio.Event().wait()
 
 
