@@ -24,6 +24,14 @@ queue_lock = asyncio.Semaphore(1)
 app = Client("tamil_dub_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 
+async def safe_edit(msg: Message, text: str):
+    """Edit a message, ignore Telegram errors like MESSAGE_NOT_MODIFIED."""
+    try:
+        await msg.edit_text(text)
+    except Exception:
+        pass
+
+
 async def start_dubbing(path: str) -> str:
     """Upload video to ElevenLabs, return dubbing_id."""
     headers = {"xi-api-key": ELEVEN_KEY}
@@ -61,10 +69,7 @@ async def wait_for_dub(dubbing_id: str, status_msg: Message) -> None:
                 raise TimeoutError("Dubbing took too long")
             if time.time() - last_edit > 120:
                 mins = int((time.time() - start) // 60)
-                try:
-                    await status_msg.edit_text(f"⏳ தமிழ் டப்பிங் நடக்குது... ({mins} நிமிடம் ஆச்சு)")
-                except Exception:
-                    pass
+                await safe_edit(status_msg, f"⏳ தமிழ் டப்பிங் நடக்குது... ({mins} நிமிடம் ஆச்சு)")
                 last_edit = time.time()
             await asyncio.sleep(POLL_SECONDS)
 
@@ -104,22 +109,22 @@ async def handle_video(_, m: Message):
     try:
         async with queue_lock:
             await m.download(file_name=src)
-            await status.edit_text("📤 ElevenLabs-க்கு அனுப்புறேன்...")
+            await safe_edit(status, "📤 ElevenLabs-க்கு அனுப்புறேன்...")
             dubbing_id = await start_dubbing(src)
 
-            await status.edit_text("⏳ தமிழ் டப்பிங் ஆரம்பம்...")
+            await safe_edit(status, "⏳ தமிழ் டப்பிங் ஆரம்பம்...")
             await wait_for_dub(dubbing_id, status)
 
-            await status.edit_text("⬇️ தமிழ் வீடியோ எடுக்கிறேன்...")
+            await safe_edit(status, "⬇️ தமிழ் வீடியோ எடுக்கிறேன்...")
             await download_dub(dubbing_id, out)
 
-            await status.edit_text("📤 உனக்கு அனுப்புறேன்...")
+            await safe_edit(status, "📤 உனக்கு அனுப்புறேன்...")
             await m.reply_video(out, caption="✅ தமிழ் டப்பிங் ரெடி!", supports_streaming=True)
             await status.delete()
     except httpx.HTTPStatusError as e:
-        await status.edit_text(f"❌ ElevenLabs பிழை: {e.response.status_code}\n{e.response.text[:300]}")
+        await safe_edit(status, f"❌ ElevenLabs பிழை: {e.response.status_code}\n{e.response.text[:300]}")
     except Exception as e:
-        await status.edit_text(f"❌ பிழை: {e}")
+        await safe_edit(status, f"❌ பிழை: {e}")
     finally:
         for p in (src, out):
             try:
