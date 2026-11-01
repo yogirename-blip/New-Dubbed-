@@ -26,6 +26,7 @@ for k in ["HF_TOKEN", "OWNER_ID"]:          # விருப்பம் (OWNER
 # விருப்பம்: இத்தனை நிமிஷம் வேலை இல்லன்னா bot தானா நிற்கும் (GPU நேரம் மிச்சம்). 0 = நிற்காது
 os.environ.setdefault("IDLE_EXIT_MIN", "30")
 os.environ.setdefault("MAX_RUN_HOURS", "11")
+os.environ.setdefault("OMNI_FP32", "1")   # float32: கரகரப்பு/ரோபோ குரல் குறையும் (கொஞ்சம் மெதுவா)
 
 os.chdir("/kaggle/working/bot")
 
