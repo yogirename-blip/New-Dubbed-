@@ -33,6 +33,7 @@ CHARS_PER_SEC = 11.0                                  # பேச்சு வ�
 # code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
 BOT_VERSION = "2026-11-01-r14 (auto review + voice match)"
 REVIEW_TIMEOUT = int(os.environ.get("REVIEW_TIMEOUT", "1200"))
+MANUAL_REVIEW = os.environ.get("MANUAL_REVIEW", "0") == "1"   # 1 போட்டா மட்டும் கையால் review
 
 LANGS = {
     "ta": ("தமிழ்", "Tamil", "tam", "Tamil", 11.0),
@@ -1560,7 +1561,6 @@ def sel_markup(key, opts):
         extra_btn("அசல் ஆடியோ", "orig"),
         extra_btn("BGM மட்டும்", "bg"),
         extra_btn("🎭 அசல் சிரிப்பு/அலறல்/மூச்சு சத்தம் சேர்", "fx"),
-        extra_btn("📝 தமிழ் வசனத்தை பார்த்துட்டு தொடங்கு (review)", "review"),
         [InlineKeyboardButton(mark(opts["doc"]) + "📄 Document (MKV)",
                               callback_data=f"sel:{key}:doc"),
          InlineKeyboardButton(mark(opts["video"]) + "🎬 Video (MP4)",
@@ -1696,7 +1696,7 @@ async def process_video(m: Message, status: Message, opts: dict):
             await safe_edit(status, "░░░░░░░░░░ 0%\n📥 வீடியோ எடுக்கிறேன்...")
             await m.download(file_name=src)
             run_opts = dict(opts)
-            if opts.get("review"):
+            if MANUAL_REVIEW and opts.get("review"):
                 def review_cb(code, segs, texts):
                     fut = asyncio.run_coroutine_threadsafe(
                         ask_review(m, workdir, code, texts), loop)
