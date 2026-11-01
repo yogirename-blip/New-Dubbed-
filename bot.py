@@ -26,14 +26,16 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 SOURCE_LANG = os.environ.get("SOURCE_LANG") or None   # ja / hi / en ... (காலியா விட்டா auto)
-NUM_STEP = int(os.environ.get("NUM_STEP", "20"))       # குறைச்சா வேகம், கூட்டினா தரம்
+NUM_STEP = int(os.environ.get("NUM_STEP", "32"))       # குறைச்சா வேகம், கூட்டினா தரம்
 BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHARS_PER_SEC = 11.0                                  # பேச்சு வேகம் (எழுத்து/வினாடி)
 # code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
-BOT_VERSION = "2026-11-01-r14 (auto review + voice match)"
+BOT_VERSION = "2026-11-01-r15 (voice lock + natural flow)"
 REVIEW_TIMEOUT = int(os.environ.get("REVIEW_TIMEOUT", "1200"))
 MANUAL_REVIEW = os.environ.get("MANUAL_REVIEW", "0") == "1"   # 1 போட்டா மட்டும் கையால் review
+OMNI_FP32 = os.environ.get("OMNI_FP32", "0") == "1"          # 1 = கரகரப்பு போகலன்னா float32
+DEMUCS_MODEL = os.environ.get("DEMUCS_MODEL", "htdemucs_ft")   # சுத்தமான குரல் பிரிப்பு (htdemucs = வேகம்)
 
 LANGS = {
     "ta": ("தமிழ்", "Tamil", "tam", "Tamil", 11.0),
@@ -74,7 +76,7 @@ def load_models():
 
     if DEVICE == "cuda":
         OMNI = OmniVoice.from_pretrained("k2-fsa/OmniVoice", device_map="cuda:0",
-                                         dtype=torch.float16)
+                                         dtype=torch.float32 if OMNI_FP32 else torch.float16)
     else:
         OMNI = OmniVoice.from_pretrained("k2-fsa/OmniVoice", device_map="cpu",
                                          dtype=torch.float32)
@@ -115,9 +117,9 @@ def separate(audio_path, workdir):
     """demucs: குரல் + BGM பிரிக்கும். (vocals_path, background_path) தரும்."""
     outdir = os.path.join(workdir, "sep")
     run([sys.executable, "-m", "demucs.separate", "--two-stems=vocals",
-         "-n", "htdemucs", "-d", DEVICE, "-o", outdir, audio_path])
+         "-n", DEMUCS_MODEL, "-d", DEVICE, "-o", outdir, audio_path])
     base = os.path.splitext(os.path.basename(audio_path))[0]
-    folder = os.path.join(outdir, "htdemucs", base)
+    folder = os.path.join(outdir, DEMUCS_MODEL, base)
     vocals = os.path.join(folder, "vocals.wav")
     bg = os.path.join(folder, "no_vocals.wav")
     if not (os.path.exists(vocals) and os.path.exists(bg)):
@@ -451,6 +453,7 @@ def build_profile(spk, segs, voc, vsr, words, refdir):
         return "".join(w for (st, en, w) in words if st >= a - 0.02 and en <= b + 0.02).strip()
 
     def save(clip, text):
+        clip = hp_filter(clip, vsr)
         pk = float(np.max(np.abs(clip))) if len(clip) else 0.0
         if pk > 1e-4:
             clip = clip * (0.9 / pk)
@@ -460,14 +463,29 @@ def build_profile(spk, segs, voc, vsr, words, refdir):
 
     for pool in (calm, idx):
         pool = sorted(pool, key=lambda i: segs[i]["end"] - segs[i]["start"], reverse=True)
-        cands = []                                        # சுத்தமான 3-9 நொடி clip-ஐ தேர்வு
+        cands = []                                        # சுத்தமான + அந்த ஆளை பிரதிபலிக்கிற clip
         for i in pool[:25]:
             a, b = segs[i]["start"], min(segs[i]["end"], segs[i]["start"] + 9.0)
             if b - a >= 3.0:
                 q = clip_quality(voc[int(a * vsr):int(b * vsr)], vsr) - 0.08 * abs((b - a) - 6.0)
-                cands.append((q, a, b))
+                cands.append([q, a, b, None])
         if cands:
-            _, a, b = max(cands)
+            cands.sort(key=lambda c: c[0], reverse=True)
+            top = cands[:6]
+            try:
+                for c in top:
+                    c[3] = voice_emb(voc[int(c[1] * vsr):int(c[2] * vsr)], vsr)
+                embs = [c[3] for c in top if c[3] is not None]
+                if len(embs) >= 3:
+                    cen = np.mean(embs, axis=0)
+                    cen = cen / (np.linalg.norm(cen) + 1e-9)
+                    for c in top:
+                        if c[3] is not None:
+                            c[0] += 2.0 * float(np.dot(c[3], cen))
+            except Exception as e:
+                log("profile centrality skip:", repr(e)[:100])
+            best = max(top, key=lambda c: c[0])
+            a, b = best[1], best[2]
             return save(voc[int(a * vsr):int(b * vsr)], words_in(a, b))
         for i in pool:                                    # ஒரே நீளமான clip
             a, b = segs[i]["start"], min(segs[i]["end"], segs[i]["start"] + 9.0)
@@ -538,7 +556,7 @@ def trim_silence(wav, sr):
 
 
 
-def merge_segments(segs, max_gap=0.7, max_dur=11.0, max_chars=260):
+def merge_segments(segs, max_gap=0.7, max_dur=7.0, max_chars=170):
     """சின்ன சின்ன வசனங்களை ஒண்ணா சேர்த்து, ஒரே ஓட்டத்துல (flow) பேச வைக்க."""
     out = []
     for s in segs:
@@ -1126,7 +1144,7 @@ def fit_to_slot(wav, sr, slot, text, ref_path, ref_text, lang="ta", target_rms=N
 
 # ---------------------------------------------------------------- AUTO QA (நீ பார்க்க வேண்டாம், bot-ஏ பாக்கும்)
 AUTO_REVIEW = os.environ.get("AUTO_REVIEW", "1") == "1"        # தமிழ் வசனத்தை தானா சரிபார்க்க
-VERIFY_TRIES = int(os.environ.get("VERIFY_TRIES", "3"))         # ஒரு வசனத்துக்கு max முயற்சி
+VERIFY_TRIES = int(os.environ.get("VERIFY_TRIES", "4"))         # ஒரு வசனத்துக்கு max முயற்சி
 VOICE_SIM_MIN = float(os.environ.get("VOICE_SIM_MIN", "0.75"))  # கேரக்டர் குரல் ஒற்றுமை (0-1)
 TEXT_SIM_MIN = float(os.environ.get("TEXT_SIM_MIN", "0.50"))    # சொன்னது = எழுதினது ஒற்றுமை (0-1)
 _REF_EMB = {}
@@ -1145,6 +1163,14 @@ def auto_review(segs, texts, src_lang, tgt="ta"):
         "speaker's personality and the original punctuation/emotion marks. If the line is already "
         "good, return it UNCHANGED. If it is empty, translate it.\n" + STYLE.get(tgt, "")
         + "\nReturn ONLY a JSON array of strings, same order and same count as the input.")
+    if tgt == "ta":
+        system += (
+            "\nNATURALNESS (very important): the line must sound like a real person talking in a Tamil "
+            "film, NOT like an AI assistant or a written essay. Use short, broken, spoken sentences, "
+            "natural interjections and fillers (அட, டேய், ஏய், சரி, ஆமா, இல்ல, என்னது), drop needless "
+            "pronouns, avoid polite textbook phrases, long complete sentences and bookish connectors. "
+            "Match each speaker's age, attitude and emotion, and keep a natural flow with the 'prev' "
+            "and 'next' lines (they are context only, never translate them).")
     if STORY_BRIEF:
         system += "\n\nSCENE BRIEF:\n" + STORY_BRIEF
     out = list(texts)
@@ -1155,6 +1181,8 @@ def auto_review(segs, texts, src_lang, tgt="ta"):
         payload = []
         for k in idx:
             d = {"id": k, "speaker": segs[k].get("speaker"), "gender": segs[k].get("gender"),
+                 "prev": segs[k - 1]["text"] if k > 0 else "",
+                 "next": segs[k + 1]["text"] if k + 1 < len(segs) else "",
                  "source": segs[k]["text"], "current": out[k],
                  "max_chars": max(10, int(segs[k]["slot"] * cps))}
             if segs[k].get("delivery"):
@@ -1223,11 +1251,52 @@ def ref_emb(path):
     return _REF_EMB[path]
 
 
-def best_take(text, ref_path, ref_text, code, base_seed, sr, tgt_f0):
-    """பல முறை உருவாக்கி: (1) சொன்னது எழுதினதோட ஒத்துப்போகணும் (2) அதே கேரக்டர் குரல்
-    (3) ஆண்/பெண் pitch மாறக்கூடாது -> சிறந்ததை தேர்வு."""
+_SPK_ANCHOR = {}
+_REF_BUZZ = {}
+
+
+def hp_filter(x, sr, fc=70.0):
+    """கீழ்-அதிர்வு இரைச்சல் நீக்கம் (reference சுத்தமாக)."""
+    try:
+        from scipy.signal import butter, sosfiltfilt
+        sos = butter(2, fc / (sr / 2.0), btype="highpass", output="sos")
+        return sosfiltfilt(sos, x).astype(np.float32)
+    except Exception:
+        return x
+
+
+def buzz(wav, sr):
+    """குரல் உள்ள இடங்கள்ல spectral flatness - அதிகம் = கரகரப்பு / இரைச்சல்."""
+    try:
+        y = to16(wav, sr)
+        S = librosa.feature.spectral_flatness(y=y)[0]
+        r = librosa.feature.rms(y=y)[0]
+        n = min(len(S), len(r))
+        S, r = S[:n], r[:n]
+        m = r > np.percentile(r, 50)
+        return float(np.mean(S[m])) if m.any() else float(np.mean(S))
+    except Exception:
+        return None
+
+
+def ref_buzz(path):
+    if path not in _REF_BUZZ:
+        try:
+            w, s_ = sf.read(path, always_2d=True)
+            _REF_BUZZ[path] = buzz(w.mean(axis=1).astype(np.float32), s_)
+        except Exception:
+            _REF_BUZZ[path] = None
+    return _REF_BUZZ[path]
+
+
+def best_take(text, ref_path, ref_text, code, base_seed, sr, tgt_f0, spk=None):
+    """பல முறை உருவாக்கி சிறந்ததை எடுக்கும்:
+    (1) சொன்னது = எழுதினது  (2) அந்த கேரக்டரோட குரல் (reference + அந்த கேரக்டரோட முந்தைய வசனங்கள்)
+    (3) கரகரப்பு இல்ல  (4) ஆண்/பெண் pitch மாறல."""
     remb = ref_emb(ref_path) if ref_path else None
-    best, best_score, best_semi = None, -9.0, 0.0
+    rbz = ref_buzz(ref_path) if ref_path else None
+    anchor = _SPK_ANCHOR.setdefault(spk, []) if spk else []
+    best, best_score, best_semi, best_e, best_vs = None, -9.0, 0.0, None, 0.0
     for t in range(max(1, VERIFY_TRIES)):
         set_seed(base_seed + 17 * t)
         wav = synth(text, ref_path, ref_text, lang=code)
@@ -1236,25 +1305,35 @@ def best_take(text, ref_path, ref_text, code, base_seed, sr, tgt_f0):
         semi = pitch_check(wav, sr, tgt_f0)
         heard = heard_text(wav, sr, code)
         ts = text_sim(text, heard) if heard is not None else 0.7
-        vs = 0.85
-        if remb is not None:
-            try:
-                e = voice_emb(wav, sr)
-                if e is not None:
-                    vs = float(np.dot(e, remb))
-            except Exception as ex:
-                log("voice_emb skip:", repr(ex)[:100])
-        score = 0.55 * ts + 0.45 * vs - 0.03 * max(0.0, abs(semi) - 3.0)
+        e, parts = None, []
+        try:
+            e = voice_emb(wav, sr)
+            if e is not None and remb is not None:
+                parts.append(float(np.dot(e, remb)))
+            if e is not None and len(anchor) >= 2:
+                cen = np.mean(anchor, axis=0)
+                cen = cen / (np.linalg.norm(cen) + 1e-9)
+                parts.append(float(np.dot(e, cen)))
+        except Exception as ex:
+            log("voice_emb skip:", repr(ex)[:100])
+        vs = float(np.mean(parts)) if parts else 0.85
+        bz = buzz(wav, sr)
+        pen_b = 0.0
+        if bz is not None and rbz:
+            pen_b = float(np.clip(bz / (rbz + 1e-6) - 1.6, 0.0, 3.0)) * 0.1
+        score = 0.45 * ts + 0.5 * vs - 0.03 * max(0.0, abs(semi) - 3.0) - pen_b
         if abs(semi) > 7:
             score -= 0.3
         if t:
-            log(f"  retry {t}: text {ts:.2f} voice {vs:.2f} pitch {semi:+.1f}")
+            log(f"  retry {t}: text {ts:.2f} voice {vs:.2f} buzz-pen {pen_b:.2f} pitch {semi:+.1f}")
         if score > best_score:
-            best, best_score, best_semi = wav, score, semi
-        if ts >= TEXT_SIM_MIN and vs >= VOICE_SIM_MIN and abs(semi) <= 4:
+            best, best_score, best_semi, best_e, best_vs = wav, score, semi, e, vs
+        if ts >= TEXT_SIM_MIN and vs >= VOICE_SIM_MIN and abs(semi) <= 4 and pen_b == 0.0:
             break
     if best is None:
         raise RuntimeError("synth காலி ஆடியோ தந்தது")
+    if spk and best_e is not None and best_vs >= VOICE_SIM_MIN * 0.92 and len(anchor) < 12:
+        anchor.append(best_e)
     return best, best_semi
 
 
@@ -1291,6 +1370,7 @@ def clip_quality(clip, sr):
 # ---------------------------------------------------------------- pipeline
 def pipeline(src, workdir, out_path, progress, opts):
     langs = [c for c in LANGS if opts.get("langs", {}).get(c)] or ["ta"]
+    _REF_EMB.clear(); _REF_BUZZ.clear(); _SPK_ANCHOR.clear()
     total, width, height = probe(src)
 
     progress("🎵 ஆடியோ எடுக்கிறேன்...", 2)
@@ -1403,14 +1483,13 @@ def pipeline(src, workdir, out_path, progress, opts):
                 continue
             try:
                 ref_path, ref_text = spk_profile.get(s["speaker"]) or (None, None)
-                if s.get("delivery") and refs[i][0]:     # கத்தல்/கிசுகிசு -> அதே ஆளோட அந்த வசன குரல்
-                    ref_path, ref_text = refs[i]
                 if not ref_path:
                     ref_path, ref_text = refs[i]
                 tgt_f0 = med_f0.get(s["speaker"]) or s.get("f0")
                 tgt_rms = s.get("rms")
                 base_seed = 1000 + sum(ord(ch) for ch in s["speaker"])
-                wav, semi = best_take(text, ref_path, ref_text, code, base_seed, sr, tgt_f0)
+                wav, semi = best_take(text, ref_path, ref_text, code, base_seed, sr, tgt_f0,
+                                      spk=s["speaker"])
                 if abs(semi) > 4:
                     log(f"{code} seg {i} {s['speaker']}: pitch வித்தியாசம் {semi:.1f} semitone")
                 wav = trim_silence(wav, sr)
