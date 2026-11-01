@@ -31,7 +31,7 @@ BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHARS_PER_SEC = 11.0                                  # பேச்சு வேகம் (எழுத்து/வினாடி)
 # code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
-BOT_VERSION = "2026-11-01-r16 (cinema-anime natural Tamil + character acting)"
+BOT_VERSION = "2026-11-01-r17 (cinema-anime natural Tamil + keep-alive/idle-exit)"
 NATURAL_TAMIL_MODE = os.environ.get("NATURAL_TAMIL_MODE", "cinema_anime_character").strip().lower()
 REVIEW_TIMEOUT = int(os.environ.get("REVIEW_TIMEOUT", "1200"))
 MANUAL_REVIEW = os.environ.get("MANUAL_REVIEW", "0") == "1"   # 1 போட்டா மட்டும் கையால் review
@@ -54,6 +54,14 @@ def log(*a):
 
 
 queue_lock = asyncio.Semaphore(1)
+
+# ---- Kaggle background-run lifecycle ----
+IDLE_EXIT_MIN = float(os.environ.get("IDLE_EXIT_MIN", "30"))   # இத்தனை நிமிஷம் வேலை இல்லன்னா bot நிற்கும் (GPU நேரம் மிச்சம்). 0 = நிற்காது
+MAX_RUN_HOURS = float(os.environ.get("MAX_RUN_HOURS", "11"))   # Kaggle session வரம்புக்கு முன் புது வீடியோ நிறுத்தம் (மணி)
+OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)           # உன் Telegram user id: bot தொடங்கும்/நிற்கும் போது message வரும்
+LAST_ACTIVE = time.time()
+KNOWN_CHATS = set()
+ACCEPTING = True
 app = Client("tamil_dub_bot", api_id=API_ID, api_hash=API_HASH,
              bot_token=BOT_TOKEN, in_memory=True)
 
@@ -1631,6 +1639,63 @@ def pipeline(src, workdir, out_path, progress, opts):
                 duration=int(total), width=width, height=height)
 
 
+# ---------------------------------------------------------------- lifecycle
+def touch(chat_id=None):
+    global LAST_ACTIVE
+    LAST_ACTIVE = time.time()
+    if chat_id:
+        KNOWN_CHATS.add(chat_id)
+
+
+async def notify(text):
+    targets = set(KNOWN_CHATS)
+    if OWNER_ID:
+        targets.add(OWNER_ID)
+    for cid in targets:
+        try:
+            await app.send_message(cid, text)
+        except Exception as e:
+            log("notify failed:", cid, repr(e)[:80])
+
+
+async def lifecycle_watchdog():
+    """வேலை இல்லாம இருந்தா / session முடியப்போனா, bot-ஐ சுத்தமா நிறுத்தும்."""
+    global ACCEPTING
+    warned = False
+    while True:
+        await asyncio.sleep(30)
+        up = time.time() - _T0
+        busy = bool(TASKS) or bool(REVIEWS)
+        near_end = up > MAX_RUN_HOURS * 3600
+        if near_end and ACCEPTING:
+            ACCEPTING = False
+            if not warned:
+                warned = True
+                await notify("⏰ Kaggle session முடியப்போகுது. புது வீடியோ இனி எடுக்க மாட்டேன்; "
+                             "இப்போ ஓடுற வேலை முடிஞ்சதும் நிற்கும். மறுபடி தொடங்க Kaggle-ல Save Version அழுத்து.")
+        idle = IDLE_EXIT_MIN > 0 and (time.time() - LAST_ACTIVE) > IDLE_EXIT_MIN * 60
+        if not busy and (idle or not ACCEPTING):
+            why = "session நேரம் முடிஞ்சது" if not ACCEPTING else f"{int(IDLE_EXIT_MIN)} நிமிஷம் வேலை இல்ல"
+            await notify(f"😴 Bot நின்னுடுச்சு ({why}). GPU நேரம் மிச்சமாச்சு. "
+                         "மறுபடி தொடங்க Kaggle-ல Save Version → Save & Run All அழுத்து.")
+            log("exiting:", why)
+            try:
+                await app.stop()
+            except Exception:
+                pass
+            os._exit(0)
+
+
+@app.on_message(filters.private, group=-1)
+async def _touch_msg(_, m: Message):
+    touch(m.chat.id)
+
+
+@app.on_callback_query(group=-1)
+async def _touch_cb(_, q):
+    touch(q.message.chat.id if q.message else None)
+
+
 # ---------------------------------------------------------------- telegram
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(_, m: Message):
@@ -1690,6 +1755,9 @@ async def handle_video(_, m: Message):
         return await apply_script(m)
     if m.document and not (m.document.mime_type or "").startswith("video/"):
         return await m.reply_text("வீடியோ கோப்பு மட்டும் அனுப்பு.")
+    if not ACCEPTING:
+        return await m.reply_text("⏰ Kaggle session முடியப்போகுது, இப்போ புது வீடியோ எடுக்க முடியாது. "
+                                  "Save Version அழுத்தி bot-ஐ மறுபடி தொடங்கிட்டு அனுப்பு.", quote=True)
     key = f"{m.chat.id}_{m.id}"
     opts = {"langs": {c: c == "ta" for c in LANGS},
             "voice": False, "orig": False, "bg": False,
@@ -1840,6 +1908,7 @@ async def process_video(m: Message, status: Message, opts: dict):
     except Exception as e:
         await safe_edit(status, f"❌ பிழை: {str(e)[:500]}")
     finally:
+        touch()
         shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -1856,6 +1925,13 @@ async def main():
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080))).start()
     await app.start()
     log("Bot started | version:", BOT_VERSION)
+    touch()
+    asyncio.create_task(lifecycle_watchdog())
+    if OWNER_ID:
+        try:
+            await app.send_message(OWNER_ID, f"✅ Bot ஆன்லைன்! வீடியோ அனுப்பு. (🔖 {BOT_VERSION})")
+        except Exception as e:
+            log("owner notice failed:", repr(e)[:80])
     await asyncio.Event().wait()
 
 
