@@ -31,7 +31,7 @@ BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHARS_PER_SEC = 11.0                                  # பேச்சு வேகம் (எழுத்து/வினாடி)
 # code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
-BOT_VERSION = "2026-11-01-r13 (pyannote + story brief + review)"
+BOT_VERSION = "2026-11-01-r14 (auto review + voice match)"
 REVIEW_TIMEOUT = int(os.environ.get("REVIEW_TIMEOUT", "1200"))
 
 LANGS = {
@@ -459,6 +459,15 @@ def build_profile(spk, segs, voc, vsr, words, refdir):
 
     for pool in (calm, idx):
         pool = sorted(pool, key=lambda i: segs[i]["end"] - segs[i]["start"], reverse=True)
+        cands = []                                        # சுத்தமான 3-9 நொடி clip-ஐ தேர்வு
+        for i in pool[:25]:
+            a, b = segs[i]["start"], min(segs[i]["end"], segs[i]["start"] + 9.0)
+            if b - a >= 3.0:
+                q = clip_quality(voc[int(a * vsr):int(b * vsr)], vsr) - 0.08 * abs((b - a) - 6.0)
+                cands.append((q, a, b))
+        if cands:
+            _, a, b = max(cands)
+            return save(voc[int(a * vsr):int(b * vsr)], words_in(a, b))
         for i in pool:                                    # ஒரே நீளமான clip
             a, b = segs[i]["start"], min(segs[i]["end"], segs[i]["start"] + 9.0)
             if b - a >= 2.5:
@@ -1071,7 +1080,17 @@ def synth(text, ref_path, ref_text, duration=None, lang="ta"):
 def fit_to_slot(wav, sr, slot, text, ref_path, ref_text, lang="ta", target_rms=None, hard=None):
     limit = max(slot, hard or slot)
     L = len(wav) / sr
-    # இயல்பான வேகத்துல பேசி, அடுத்த வசனம் தொடங்கும் முன் முடிஞ்சா போதும் (ரோபோ மாதிரி வேகப்படுத்தாம)
+    # முதல்ல வார்த்தையை சுருக்கு (வேகப்படுத்தினா ரோபோ மாதிரி ஆகும்)
+    if L > limit * 1.15:
+        short = shorten_line(text, int(len(text) * limit / L * 0.95), lang)
+        if short:
+            try:
+                w2 = trim_silence(synth(short, ref_path, ref_text, lang=lang), sr)
+                if 0 < len(w2) < len(wav):
+                    wav, text = w2, short
+                    L = len(wav) / sr
+            except Exception as e:
+                log("shorten regen failed:", repr(e)[:100])
     if L > limit:
         rate = L / limit
         if rate <= 1.15:
@@ -1102,6 +1121,170 @@ def fit_to_slot(wav, sr, slot, text, ref_path, ref_text, lang="ta", target_rms=N
     if peak > 0.95:
         wav = wav * (0.95 / peak)
     return wav
+
+
+# ---------------------------------------------------------------- AUTO QA (நீ பார்க்க வேண்டாம், bot-ஏ பாக்கும்)
+AUTO_REVIEW = os.environ.get("AUTO_REVIEW", "1") == "1"        # தமிழ் வசனத்தை தானா சரிபார்க்க
+VERIFY_TRIES = int(os.environ.get("VERIFY_TRIES", "3"))         # ஒரு வசனத்துக்கு max முயற்சி
+VOICE_SIM_MIN = float(os.environ.get("VOICE_SIM_MIN", "0.75"))  # கேரக்டர் குரல் ஒற்றுமை (0-1)
+TEXT_SIM_MIN = float(os.environ.get("TEXT_SIM_MIN", "0.50"))    # சொன்னது = எழுதினது ஒற்றுமை (0-1)
+_REF_EMB = {}
+
+
+def auto_review(segs, texts, src_lang, tgt="ta"):
+    """Gemini 2-ஆவது முறை: அசல் வசனம் vs தமிழ் வசனம் ஒப்பிட்டு, தப்பு / ஆண்-பெண் வடிவம் / நீளம் திருத்தும்."""
+    if not GEMINI_KEY:
+        return texts
+    _, name, _, script, cps = LANGS[tgt]
+    system = (
+        f"You are a strict {name} dubbing QA editor. For each item compare 'source' with the current "
+        f"'{name.lower()}' line and FIX only real problems: wrong or missing meaning, mistranslated "
+        f"words, wrong gender/respect forms for the speaker, formal/bookish {name} (make it natural "
+        "spoken style), English letters, or a line longer than max_chars (shorten it). Keep the "
+        "speaker's personality and the original punctuation/emotion marks. If the line is already "
+        "good, return it UNCHANGED. If it is empty, translate it.\n" + STYLE.get(tgt, "")
+        + "\nReturn ONLY a JSON array of strings, same order and same count as the input.")
+    if STORY_BRIEF:
+        system += "\n\nSCENE BRIEF:\n" + STORY_BRIEF
+    out = list(texts)
+    changed = 0
+    B = 20
+    for i in range(0, len(segs), B):
+        idx = list(range(i, min(i + B, len(segs))))
+        payload = []
+        for k in idx:
+            d = {"id": k, "speaker": segs[k].get("speaker"), "gender": segs[k].get("gender"),
+                 "source": segs[k]["text"], "current": out[k],
+                 "max_chars": max(10, int(segs[k]["slot"] * cps))}
+            if segs[k].get("delivery"):
+                d["delivery"] = segs[k]["delivery"]
+            payload.append(d)
+        try:
+            res = gemini_batch(payload, src_lang, tgt,
+                               prompt=(system, "INPUT:\n" + json.dumps(payload, ensure_ascii=False)))
+        except Exception as e:
+            log("auto_review skip:", str(e).replace(GEMINI_KEY, "***")[:150])
+            continue
+        for k, t in zip(idx, res):
+            t = (t or "").strip()
+            if tgt == "ta":
+                t = colloquial_ta(t)
+            limit = max(10, int(segs[k]["slot"] * cps)) * 1.25
+            if t and t != out[k] and len(t) <= limit:
+                out[k] = t
+                changed += 1
+    log(f"auto_review: {changed}/{len(segs)} வசனம் திருத்தினேன்")
+    return out
+
+
+def _norm_txt(t):
+    return re.sub(r"[^\u0B80-\u0BFFa-zA-Z0-9]", "", t or "")
+
+
+def text_sim(a, b):
+    import difflib
+    a, b = _norm_txt(a), _norm_txt(b)
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def heard_text(wav, sr, lang):
+    """உருவாக்கின தமிழ் ஆடியோவை Whisper-ஆ மறுபடி கேட்டு எழுத்தா மாத்தும்."""
+    try:
+        segs, _ = WHISPER.transcribe(to16(wav, sr), language=lang, beam_size=1,
+                                     vad_filter=False, condition_on_previous_text=False)
+        return " ".join((s.text or "").strip() for s in segs).strip()
+    except Exception as e:
+        log("heard_text skip:", repr(e)[:100])
+        return None
+
+
+def voice_emb(wav, sr):
+    fe, m = _load_spk_model()
+    x = to16(wav, sr)[:SR16 * 10]
+    if len(x) < SR16 * 0.5:
+        return None
+    inp = fe(x, sampling_rate=SR16, return_tensors="pt", padding=True)
+    with torch.no_grad():
+        e = m(**{k: v.to(DEVICE) for k, v in inp.items()}).embeddings
+    return torch.nn.functional.normalize(e, dim=-1)[0].float().cpu().numpy()
+
+
+def ref_emb(path):
+    if path not in _REF_EMB:
+        try:
+            w, s = sf.read(path, always_2d=True)
+            _REF_EMB[path] = voice_emb(w.mean(axis=1).astype(np.float32), s)
+        except Exception as e:
+            log("ref_emb skip:", repr(e)[:100])
+            _REF_EMB[path] = None
+    return _REF_EMB[path]
+
+
+def best_take(text, ref_path, ref_text, code, base_seed, sr, tgt_f0):
+    """பல முறை உருவாக்கி: (1) சொன்னது எழுதினதோட ஒத்துப்போகணும் (2) அதே கேரக்டர் குரல்
+    (3) ஆண்/பெண் pitch மாறக்கூடாது -> சிறந்ததை தேர்வு."""
+    remb = ref_emb(ref_path) if ref_path else None
+    best, best_score, best_semi = None, -9.0, 0.0
+    for t in range(max(1, VERIFY_TRIES)):
+        set_seed(base_seed + 17 * t)
+        wav = synth(text, ref_path, ref_text, lang=code)
+        if len(wav) < sr * 0.15:
+            continue
+        semi = pitch_check(wav, sr, tgt_f0)
+        heard = heard_text(wav, sr, code)
+        ts = text_sim(text, heard) if heard is not None else 0.7
+        vs = 0.85
+        if remb is not None:
+            try:
+                e = voice_emb(wav, sr)
+                if e is not None:
+                    vs = float(np.dot(e, remb))
+            except Exception as ex:
+                log("voice_emb skip:", repr(ex)[:100])
+        score = 0.55 * ts + 0.45 * vs - 0.03 * max(0.0, abs(semi) - 3.0)
+        if abs(semi) > 7:
+            score -= 0.3
+        if t:
+            log(f"  retry {t}: text {ts:.2f} voice {vs:.2f} pitch {semi:+.1f}")
+        if score > best_score:
+            best, best_score, best_semi = wav, score, semi
+        if ts >= TEXT_SIM_MIN and vs >= VOICE_SIM_MIN and abs(semi) <= 4:
+            break
+    if best is None:
+        raise RuntimeError("synth காலி ஆடியோ தந்தது")
+    return best, best_semi
+
+
+def shorten_line(text, max_chars, code="ta"):
+    """வசனம் நேரத்துக்கு நீளமா இருந்தா, வேகப்படுத்தாம வார்த்தைகளை சுருக்கும்."""
+    if not GEMINI_KEY or max_chars < 6:
+        return None
+    system = (f"Shorten this {LANGS[code][1]} dubbing line to at most {int(max_chars)} characters. "
+              "Keep meaning, emotion, casual spoken style and the punctuation. "
+              "Return ONLY a JSON array with one string.")
+    try:
+        r = gemini_batch([{"text": text, "slot": 3.0}], "ta", code,
+                         prompt=(system, json.dumps([text], ensure_ascii=False)))
+    except Exception as e:
+        log("shorten skip:", repr(e)[:100])
+        return None
+    t = (r[0] if r else "").strip()
+    return t if t and len(t) < len(text) else None
+
+
+def clip_quality(clip, sr):
+    """reference-க்கு சுத்தமான, தொடர்ச்சியான குரல் clip-ஆ (BGM/இரைச்சல் குறைவு) பாக்க."""
+    try:
+        y = to16(clip, sr)
+        flat = float(np.mean(librosa.feature.spectral_flatness(y=y)))
+        r = librosa.feature.rms(y=y)[0]
+        steady = float(np.std(r) / (np.mean(r) + 1e-6))
+        voiced = float(np.mean(r > 0.3 * np.mean(r)))
+        return voiced - flat * 4.0 - steady * 0.3
+    except Exception:
+        return 0.0
 
 
 # ---------------------------------------------------------------- pipeline
@@ -1189,6 +1372,9 @@ def pipeline(src, workdir, out_path, progress, opts):
         progress(f"🌐 {lname} மொழிபெயர்க்கிறேன்... ({n_seg} வசனம்)", int(p0))
         try:
             texts = translate_all(segs, src_lang, code)
+            if AUTO_REVIEW:                            # நீ பாக்க வேண்டாம் - bot-ஏ சரிபார்க்கும்
+                progress(f"🧐 {lname} வசனங்களை தானா சரிபார்க்கிறேன்...", int(p0 + span * 0.08))
+                texts = auto_review(segs, texts, src_lang, code)
             if opts.get("_review"):                    # நீ பார்த்து திருத்த
                 try:
                     texts = opts["_review"](code, segs, texts)
@@ -1216,22 +1402,14 @@ def pipeline(src, workdir, out_path, progress, opts):
                 continue
             try:
                 ref_path, ref_text = spk_profile.get(s["speaker"]) or (None, None)
+                if s.get("delivery") and refs[i][0]:     # கத்தல்/கிசுகிசு -> அதே ஆளோட அந்த வசன குரல்
+                    ref_path, ref_text = refs[i]
                 if not ref_path:
                     ref_path, ref_text = refs[i]
                 tgt_f0 = med_f0.get(s["speaker"]) or s.get("f0")
                 tgt_rms = s.get("rms")
-                set_seed(1000 + sum(ord(ch) for ch in s["speaker"]))
                 base_seed = 1000 + sum(ord(ch) for ch in s["speaker"])
-                wav = synth(text, ref_path, ref_text, lang=code)
-                semi = pitch_check(wav, sr, tgt_f0)
-                tries = 0
-                while abs(semi) > 7 and tries < 1:      # ஆண்/பெண் குரல் மாறிடுச்சு -> வேற seed-ல மறுபடி
-                    tries += 1
-                    set_seed(base_seed + 17 * tries)
-                    w2 = synth(text, ref_path, ref_text, lang=code)
-                    s2 = pitch_check(w2, sr, tgt_f0)
-                    if abs(s2) < abs(semi):
-                        wav, semi = w2, s2
+                wav, semi = best_take(text, ref_path, ref_text, code, base_seed, sr, tgt_f0)
                 if abs(semi) > 4:
                     log(f"{code} seg {i} {s['speaker']}: pitch வித்தியாசம் {semi:.1f} semitone")
                 wav = trim_silence(wav, sr)
