@@ -31,7 +31,8 @@ BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHARS_PER_SEC = 11.0                                  # பேச்சு வேகம் (எழுத்து/வினாடி)
 # code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
-BOT_VERSION = "2026-11-01-r15 (voice lock + natural flow)"
+BOT_VERSION = "2026-11-01-r16 (cinema-anime natural Tamil + character acting)"
+NATURAL_TAMIL_MODE = os.environ.get("NATURAL_TAMIL_MODE", "cinema_anime_character").strip().lower()
 REVIEW_TIMEOUT = int(os.environ.get("REVIEW_TIMEOUT", "1200"))
 MANUAL_REVIEW = os.environ.get("MANUAL_REVIEW", "0") == "1"   # 1 போட்டா மட்டும் கையால் review
 OMNI_FP32 = os.environ.get("OMNI_FP32", "0") == "1"          # 1 = கரகரப்பு போகலன்னா float32
@@ -790,6 +791,25 @@ def story_brief(segs, src_lang):
         return ""
 
 
+TA_DIALOGUE = (
+    "TAMIL DIALOGUE STYLE (MANDATORY): This is a dubbed movie/anime, NOT a book, news report, "
+    "school essay or formal translation. Write the way real Tamil actors speak naturally in daily "
+    "conversation. Prefer spoken forms: நாங்க, நீங்க, அவங்க, இங்க, அங்க, இப்போ, அப்போ, இல்ல, "
+    "வேணும், போறேன், வர்றேன், சொல்றேன், பண்ணுறேன், தெரியல, புரியல, என்னாச்சு, அப்படியா. "
+    "Avoid literary forms: நாங்கள், நீங்கள், அவர்கள், இங்கு, அங்கு, தற்போது, மிகவும், வேண்டும், "
+    "இல்லை, செய்கிறேன், கூறினான், என்றான், ஆகையால், இருப்பினும், மேலும். Do not mechanically "
+    "swap words; rewrite the whole sentence if needed so it sounds like spoken dialogue. Use short, "
+    "punchy, speakable lines, natural pauses and contractions. Preserve meaning; add no plot facts.\n"
+    "CHARACTER ACTING: the same speaker id must retain a consistent personality and way of addressing "
+    "others. Match age, attitude, relationship and gender. A hot-headed teen can be blunt; a villain "
+    "can be cold and sharp; a child can sound simple; an elderly character can be respectful without "
+    "sounding literary. For anime, retain energetic reactions, dramatic punch, humour and catchphrases "
+    "naturally in Tamil; do not make every character sound alike.\n"
+    "Examples: 'What are you doing?' -> 'என்ன பண்ணுற?', 'I don't know' -> 'எனக்குத் தெரியல', "
+    "'We have to go now' -> 'நாம இப்போ போகணும்'. Examples guide style, not fixed translations.\n"
+)
+
+
 def _gem_prompt(items, src_lang, tgt="ta"):
     """(system instruction, user text)"""
     _, name, _, script, cps = LANGS[tgt]
@@ -803,7 +823,7 @@ def _gem_prompt(items, src_lang, tgt="ta"):
             d["delivery"] = s_["delivery"]
         payload.append(d)
     system = (
-        f"You are a professional {name} dubbing writer for films and series. Translate each line "
+        f"You are a professional {name} cinema and anime dubbing dialogue writer. Translate each line "
         f"(source language: {src_lang or 'auto'}) into {name} ({script} script) for dubbing.\n"
         + STYLE.get(tgt, "Use casual spoken style.") + "\n" + FLOW_RULES + "\n"
         "Each input may carry 'speaker' (same id = same person) and 'speaker_gender': keep each "
@@ -811,6 +831,7 @@ def _gem_prompt(items, src_lang, tgt="ta"):
         "Hindi, Telugu, Kannada, Malayalam). 'delivery': 'shouting' -> write it as a shout: short, "
         "emphatic, ending with '!'; 'whisper' -> soft and short with '...'. Keep the original "
         "punctuation and emotion marks (! ? …) because they control the voice's emotion.\n"
+        + (TA_DIALOGUE if tgt == "ta" else "") +
         "Rules: keep meaning and emotion; each translation MUST be at most max_chars characters "
         f"(shorten the wording if needed, never exceed it); write names in {script} script; write "
         f"numbers as {name} words; no English letters, no emojis, no explanations.\n"
@@ -982,11 +1003,17 @@ ALWAYS_REWRITE = os.environ.get("ALWAYS_REWRITE", "1") == "1"
 
 def gemini_colloquialize(lines, tgt="ta"):
     """இன்னும் செந்தமிழ்ல இருக்கிற வரிகளை மட்டும் பேச்சு வழக்குக்கு திருப்பி எழுத (ஒரு முறை)."""
-    system = ("Rewrite each Tamil dubbing line from formal/literary Tamil into natural COLLOQUIAL spoken "
-              "Tamil (பேச்சு வழக்கு) exactly like friends talking in a Tamil film. Keep the meaning, "
-              "emotion, punctuation and roughly the same length (never longer). If a line is already "
-              "colloquial keep it. Typical fixes: வைத்துள்ளேன் -> வச்சிருக்கேன், வந்தனர் -> வந்தாங்க, "
-              "செய்கிறேன் -> பண்ணுறேன், நாங்கள் -> நாங்க. " + STYLE["ta"] +
+    system = ("You are the final dialogue polish editor for a Tamil movie/anime dub. Rewrite every "
+              "line into believable everyday spoken Tamil (பேச்சுத் தமிழ்), like trained Tamil dubbing "
+              "artists naturally speak, not written or literary Tamil. Preserve meaning, speaker "
+              "personality, relationship, gender, emotion and movie/anime dramatic energy. Keep each "
+              "speaker's individual voice: blunt, shy, funny, arrogant, childish, villainous, respectful "
+              "or elderly as context indicates. Prefer நாங்க, நீங்க, அவங்க, இங்க, அங்க, இப்போ, இல்ல, "
+              "வேணும், போறேன், வர்றேன், சொல்றேன், பண்ணுறேன், தெரியல, புரியல. Avoid நாங்கள், நீங்கள், "
+              "அவர்கள், இங்கு, அங்கு, தற்போது, மிகவும், வேண்டும், இல்லை, செய்கிறேன், என்றான், ஆகையால், "
+              "இருப்பினும். Do not just swap words; rebuild awkward sentences as short, speakable "
+              "dialogue. Do not add plot details or forced slang. Keep punctuation and roughly the same "
+              "length (never longer). If already natural, keep it. " + STYLE["ta"] +
               "\nReturn ONLY a JSON array of strings, same order and count.")
     user = "INPUT:\n" + json.dumps(lines, ensure_ascii=False)
     items = [{"text": t, "slot": 3.0} for t in lines]
