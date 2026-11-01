@@ -31,7 +31,8 @@ BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHARS_PER_SEC = 11.0                                  # பேச்சு வேகம் (எழுத்து/வினாடி)
 # code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
-BOT_VERSION = "2026-11-01-r12 (faster + ETA)"
+BOT_VERSION = "2026-11-01-r13 (pyannote + story brief + review)"
+REVIEW_TIMEOUT = int(os.environ.get("REVIEW_TIMEOUT", "1200"))
 
 LANGS = {
     "ta": ("தமிழ்", "Tamil", "tam", "Tamil", 11.0),
@@ -227,6 +228,59 @@ def cluster_embeddings(embs, thr):
     return members, best_pair_sim
 
 
+_PYA = None
+
+
+def pyannote_speakers(segs, vocals_path, gender):
+    """pyannote (HF_TOKEN இருந்தா) - யார் எப்போ பேசுறாங்கன்னு துல்லியமா."""
+    tok = os.environ.get("HF_TOKEN")
+    if not tok or not vocals_path:
+        return None
+    global _PYA
+    if _PYA is None:
+        from pyannote.audio import Pipeline
+        name = "pyannote/speaker-diarization-3.1"
+        try:
+            pipe = Pipeline.from_pretrained(name, token=tok)
+        except TypeError:
+            pipe = Pipeline.from_pretrained(name, use_auth_token=tok)
+        if pipe is None:
+            raise RuntimeError("pyannote model access இல்ல (HF-ல நிபந்தனை ஏத்துக்கணும்)")
+        pipe.to(torch.device(DEVICE))
+        _PYA = pipe
+    out = _PYA(vocals_path)
+    ann = getattr(out, "speaker_diarization", out)
+    turns = [(t.start, t.end, lab) for t, _, lab in ann.itertracks(yield_label=True)]
+    if not turns:
+        return None
+    label = {}
+    for i, sg in enumerate(segs):
+        ov = {}
+        for a, b, lab in turns:
+            o = min(b, sg["end"]) - max(a, sg["start"])
+            if o > 0:
+                ov[lab] = ov.get(lab, 0.0) + o
+        if ov:
+            label[i] = max(ov, key=ov.get)
+    if not label:
+        return None
+    known = sorted(label)
+    for i in range(len(segs)):
+        if i not in label:
+            label[i] = label[min(known, key=lambda j: abs(j - i))]
+    spk, count, names = [None] * len(segs), {"M": 0, "F": 0}, {}
+    for lab in sorted(set(label.values())):
+        gs = [gender[i] for i in range(len(segs)) if label[i] == lab]
+        g = "F" if gs.count("female") > len(gs) / 2 else "M"
+        names[lab] = f"{g}{count[g]}"
+        count[g] += 1
+    for i in range(len(segs)):
+        spk[i] = names[label[i]]
+        gender[i] = "female" if spk[i][0] == "F" else "male"
+    log(f"pyannote: {len(names)} ஆட்கள்")
+    return spk
+
+
 def embed_speakers(segs, voc16, gender):
     embs = seg_embeddings(segs, voc16)
     members, nxt = cluster_embeddings(embs, SPK_SIM)
@@ -254,7 +308,7 @@ def embed_speakers(segs, voc16, gender):
     return spk
 
 
-def assign_speakers(segs, voc16):
+def assign_speakers(segs, voc16, vocals_path=None):
     """ஆண்/பெண் + ஆளை (speaker) கண்டுபிடிக்கும் (pitch + MFCC clustering)."""
     mfs, f0s = [], []
     for s in segs:
@@ -291,7 +345,12 @@ def assign_speakers(segs, voc16):
 
     spk = None
     try:
-        spk = embed_speakers(segs, voc16, gender)
+        spk = pyannote_speakers(segs, vocals_path, gender)
+    except Exception as e:
+        log("pyannote failed, WavLM-க்கு மாறுறேன்:", repr(e)[:150])
+    try:
+        if spk is None:
+            spk = embed_speakers(segs, voc16, gender)
     except Exception as e:
         log("speaker embedding failed, MFCC fallback:", repr(e)[:150])
     if spk is None:
@@ -420,6 +479,17 @@ def build_profile(spk, segs, voc, vsr, words, refdir):
         if total >= 1.0:
             return save(np.concatenate(clips), " ".join(texts))
     return None, None
+
+
+def loudnorm_file(path, sr):
+    """எல்லா track-உம் ஒரே சத்த அளவுல (ஒலிம்பிக் மாதிரி: -16 LUFS)."""
+    tmp = path + ".ln.wav"
+    try:
+        run(["ffmpeg", "-y", "-i", path, "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+             "-ar", str(sr), tmp])
+        os.replace(tmp, path)
+    except Exception as e:
+        log("loudnorm skip:", repr(e)[:100])
 
 
 def pitch_check(wav, sr, target_f0, tol_semi=3.5):
@@ -638,6 +708,60 @@ FLOW_RULES = (
 )
 
 
+STORY_BRIEF = ""
+
+
+def set_brief(t):
+    global STORY_BRIEF
+    STORY_BRIEF = t or ""
+
+
+def gemini_text(system, user):
+    """JSON இல்லாத சாதாரண text பதில் (கதை சுருக்கத்துக்கு)."""
+    models = [_GEM_MODEL] if _GEM_MODEL else _gem_candidates()
+    body = {"systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "generationConfig": {"temperature": 0.3}}
+    for m in models[:8]:
+        try:
+            r = httpx.post(f"{_GEM_BASE}/models/{m}:generateContent",
+                           headers=_gem_headers(), json=body, timeout=90)
+        except httpx.HTTPError:
+            continue
+        if r.status_code in _SKIP_CODES:
+            continue
+        if r.status_code != 200:
+            break
+        try:
+            return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception:
+            continue
+    return ""
+
+
+def story_brief(segs, src_lang):
+    """முழு உரையாடலை படிச்சு: கேரக்டர்கள், உறவு, பெயர்கள், tone -> மொழிபெயர்ப்புக்கு வழிகாட்டி."""
+    if not GEMINI_KEY:
+        return ""
+    lines, size = [], 0
+    for i, s in enumerate(segs):
+        ln = f"{s.get('speaker')}({s.get('gender')}): {s['text']}"
+        size += len(ln)
+        if size > 14000:
+            break
+        lines.append(ln)
+    system = ("You are a film dubbing director preparing a Tamil dub. Read the dialogue and write a SHORT "
+              "brief (max 1100 characters, English): 1) each speaker id with gender, approx age, role and "
+              "how they talk (rowdy, polite, elderly, childish, villain...). 2) relationships and how they "
+              "address each other (டா, டி, அண்ணா, அம்மா, சார், மச்சான்...). 3) character/place names with "
+              "their Tamil-script spelling. 4) genre and overall tone. No preamble.")
+    try:
+        return gemini_text(system, "SOURCE LANGUAGE: " + (src_lang or "auto") + "\n" + "\n".join(lines))[:1300]
+    except Exception as e:
+        log("story brief failed:", repr(e)[:100])
+        return ""
+
+
 def _gem_prompt(items, src_lang, tgt="ta"):
     """(system instruction, user text)"""
     _, name, _, script, cps = LANGS[tgt]
@@ -663,6 +787,9 @@ def _gem_prompt(items, src_lang, tgt="ta"):
         f"(shorten the wording if needed, never exceed it); write names in {script} script; write "
         f"numbers as {name} words; no English letters, no emojis, no explanations.\n"
         "Return ONLY a JSON array of strings, same order and same count as the input.")
+    if STORY_BRIEF:
+        system += ("\n\nSCENE BRIEF (use it so every character keeps a consistent voice, names and "
+                   "forms of address):\n" + STORY_BRIEF)
     user = "INPUT:\n" + json.dumps(payload, ensure_ascii=False)
     return system, user
 
@@ -1008,7 +1135,7 @@ def pipeline(src, workdir, out_path, progress, opts):
     voc16 = to16(voc, vsr)
     progress("👥 யார் யார் பேசுறாங்கன்னு (ஆண்/பெண்) பாக்குறேன்...", 38)
     try:
-        assign_speakers(segs, voc16)
+        assign_speakers(segs, voc16, vocals if vocals != audio else None)
     except Exception as e:
         log("speaker analysis failed:", repr(e)[:150])
         for s_ in segs:
@@ -1017,6 +1144,9 @@ def pipeline(src, workdir, out_path, progress, opts):
     segs = merge_segments(segs)          # flow-க்காக சேர்த்தல் (அதே ஆள் மட்டும்)
     med_f0 = finalize_segs(segs, voc16)
     add_slots(segs, total)
+    progress("🎬 கதையையும் கேரக்டர்களையும் புரிஞ்சுக்கிறேன்...", 40)
+    set_brief(story_brief(segs, src_lang))
+    log("story brief:", (STORY_BRIEF[:160] or "இல்ல").replace("\n", " "))
     log(f"merged for flow: {raw_n} -> {len(segs)} segments;",
         "shout:", sum(1 for x in segs if x["delivery"] == "shouting"))
 
@@ -1059,6 +1189,11 @@ def pipeline(src, workdir, out_path, progress, opts):
         progress(f"🌐 {lname} மொழிபெயர்க்கிறேன்... ({n_seg} வசனம்)", int(p0))
         try:
             texts = translate_all(segs, src_lang, code)
+            if opts.get("_review"):                    # நீ பார்த்து திருத்த
+                try:
+                    texts = opts["_review"](code, segs, texts)
+                except Exception as e:
+                    log("review skip:", repr(e)[:100])
         except Exception as e:
             log(f"{code} translate failed:", repr(e)[:150])
             skipped.append(code)
@@ -1124,6 +1259,7 @@ def pipeline(src, workdir, out_path, progress, opts):
             mix = mix * (0.98 / peak)
         mix_path = os.path.join(workdir, f"mix_{code}.wav")
         sf.write(mix_path, mix, bsr)
+        loudnorm_file(mix_path, bsr)
         results.append(dict(code=code, mix=mix_path, dub=dub, failed=failed, texts=texts))
 
     if not results:
@@ -1246,6 +1382,7 @@ def sel_markup(key, opts):
         extra_btn("அசல் ஆடியோ", "orig"),
         extra_btn("BGM மட்டும்", "bg"),
         extra_btn("🎭 அசல் சிரிப்பு/அலறல்/மூச்சு சத்தம் சேர்", "fx"),
+        extra_btn("📝 தமிழ் வசனத்தை பார்த்துட்டு தொடங்கு (review)", "review"),
         [InlineKeyboardButton(mark(opts["doc"]) + "📄 Document (MKV)",
                               callback_data=f"sel:{key}:doc"),
          InlineKeyboardButton(mark(opts["video"]) + "🎬 Video (MP4)",
@@ -1264,12 +1401,15 @@ SEL_TEXT = ("🎧 எந்தெந்த மொழியில் டப் �
 
 @app.on_message(filters.private & (filters.video | filters.document))
 async def handle_video(_, m: Message):
+    if (m.document and (m.document.file_name or "").lower().endswith(".txt")
+            and m.chat.id in REVIEWS):
+        return await apply_script(m)
     if m.document and not (m.document.mime_type or "").startswith("video/"):
         return await m.reply_text("வீடியோ கோப்பு மட்டும் அனுப்பு.")
     key = f"{m.chat.id}_{m.id}"
     opts = {"langs": {c: c == "ta" for c in LANGS},
             "voice": False, "orig": False, "bg": False,
-            "doc": True, "video": False, "fx": True}
+            "doc": True, "video": False, "fx": True, "review": False}
     PENDING[key] = {"m": m, "opts": opts}
     await m.reply_text(SEL_TEXT, reply_markup=sel_markup(key, opts), quote=True)
 
@@ -1283,7 +1423,7 @@ async def on_select(_, q):
     opts = st["opts"]
     if act in LANGS:
         opts["langs"][act] = not opts["langs"][act]
-    elif act in ("voice", "orig", "bg", "doc", "video", "fx"):
+    elif act in ("voice", "orig", "bg", "doc", "video", "fx", "review"):
         opts[act] = not opts[act]
     elif act == "go":
         if not any(opts["langs"].values()):
@@ -1302,6 +1442,57 @@ async def on_select(_, q):
     except Exception:
         pass
     await q.answer()
+
+
+REVIEWS = {}
+
+
+async def ask_review(m: Message, workdir, code, texts):
+    """தமிழ் வசனங்களை அனுப்பி, திருத்தின file வந்தா / சரி-ன்னா தொடரும்."""
+    chat = m.chat.id
+    path = os.path.join(workdir, f"script_{code}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(f"{i + 1}|{t}" for i, t in enumerate(texts)))
+    fut = asyncio.get_running_loop().create_future()
+    REVIEWS[chat] = {"fut": fut, "texts": list(texts)}
+    await m.reply_document(
+        path, caption=(f"📝 {LANGS[code][0]} வசனங்கள். திருத்தணும்னா file-ல 'எண்|வசனம்' வடிவத்துல "
+                       "மாத்தி, அதே .txt file-ஐ திருப்பி அனுப்பு. சரின்னா கீழ அழுத்து "
+                       f"({REVIEW_TIMEOUT // 60} நிமிஷத்துல பதில் வரலைன்னா தானா தொடரும்)."),
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ சரி, தொடங்கு", callback_data=f"rv:{chat}")]]))
+    try:
+        return await asyncio.wait_for(fut, REVIEW_TIMEOUT)
+    except asyncio.TimeoutError:
+        return REVIEWS[chat]["texts"]
+    finally:
+        REVIEWS.pop(chat, None)
+
+
+@app.on_callback_query(filters.regex(r"^rv:"))
+async def on_review_ok(_, q):
+    chat = int(q.data.split(":")[1])
+    st = REVIEWS.get(chat)
+    if st and not st["fut"].done():
+        st["fut"].set_result(st["texts"])
+    await q.answer("தொடங்குறேன்...")
+
+
+async def apply_script(m: Message):
+    st = REVIEWS.get(m.chat.id)
+    path = await m.download()
+    texts = st["texts"]
+    n = 0
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        for ln in f:
+            if "|" in ln:
+                a, b = ln.split("|", 1)
+                if a.strip().isdigit() and 1 <= int(a) <= len(texts) and b.strip():
+                    texts[int(a) - 1] = b.strip()
+                    n += 1
+    await m.reply_text(f"✅ {n} வசனம் திருத்தினேன், தொடர்கிறேன்.")
+    if not st["fut"].done():
+        st["fut"].set_result(texts)
 
 
 async def process_video(m: Message, status: Message, opts: dict):
@@ -1326,7 +1517,14 @@ async def process_video(m: Message, status: Message, opts: dict):
         async with queue_lock:
             await safe_edit(status, "░░░░░░░░░░ 0%\n📥 வீடியோ எடுக்கிறேன்...")
             await m.download(file_name=src)
-            info = await asyncio.to_thread(pipeline, src, workdir, out, progress, opts)
+            run_opts = dict(opts)
+            if opts.get("review"):
+                def review_cb(code, segs, texts):
+                    fut = asyncio.run_coroutine_threadsafe(
+                        ask_review(m, workdir, code, texts), loop)
+                    return fut.result(timeout=REVIEW_TIMEOUT + 60)
+                run_opts["_review"] = review_cb
+            info = await asyncio.to_thread(pipeline, src, workdir, out, progress, run_opts)
             await safe_edit(status, "▓▓▓▓▓▓▓▓▓▓ 100%\n📤 உனக்கு அனுப்புறேன்...")
             cap = f"✅ டப்பிங் ரெடி!\n(மூல மொழி: {info['lang']}, {info['n']} வசனம்"
             cap += f", {info['failed']} தவறியது)" if info["failed"] else ")"
