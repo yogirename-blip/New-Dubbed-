@@ -31,7 +31,7 @@ BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHARS_PER_SEC = 11.0                                  # பேச்சு வேகம் (எழுத்து/வினாடி)
 # code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
-BOT_VERSION = "2026-11-01-r17 (cinema-anime natural Tamil + keep-alive/idle-exit)"
+BOT_VERSION = "2026-11-01-r18 (keep-alive + speaker report)"
 NATURAL_TAMIL_MODE = os.environ.get("NATURAL_TAMIL_MODE", "cinema_anime_character").strip().lower()
 REVIEW_TIMEOUT = int(os.environ.get("REVIEW_TIMEOUT", "1200"))
 MANUAL_REVIEW = os.environ.get("MANUAL_REVIEW", "0") == "1"   # 1 போட்டா மட்டும் கையால் review
@@ -1287,6 +1287,7 @@ def ref_emb(path):
 
 
 _SPK_ANCHOR = {}
+_VS_LOG = {}      # speaker -> [voice similarity of chosen takes] (diagnostics)
 _REF_BUZZ = {}
 
 
@@ -1369,6 +1370,8 @@ def best_take(text, ref_path, ref_text, code, base_seed, sr, tgt_f0, spk=None):
         raise RuntimeError("synth காலி ஆடியோ தந்தது")
     if spk and best_e is not None and best_vs >= VOICE_SIM_MIN * 0.92 and len(anchor) < 12:
         anchor.append(best_e)
+    if spk:
+        _VS_LOG.setdefault(spk, []).append(best_vs)
     return best, best_semi
 
 
@@ -1403,9 +1406,22 @@ def clip_quality(clip, sr):
 
 
 # ---------------------------------------------------------------- pipeline
+def speaker_report(segs, spk_profile):
+    """எத்தனை கேரக்டர் கண்டுபிடிச்சது + ஒவ்வொருத்தர் குரல் எவ்வளவு ஒத்துப்போச்சுன்னு (0-1)."""
+    parts = []
+    for k in sorted({x["speaker"] for x in segs}):
+        mine = [x for x in segs if x["speaker"] == k]
+        g = "பெண்" if mine[0].get("gender") == "female" else "ஆண்"
+        vs = _VS_LOG.get(k) or []
+        sim = f"{float(np.mean(vs)):.2f}" if vs else "-"
+        ok = "✓" if spk_profile.get(k, (None,))[0] else "✗ref இல்ல"
+        parts.append(f"{k} {g}: {len(mine)} வசனம், குரல் ஒற்றுமை {sim} {ok}")
+    return parts
+
+
 def pipeline(src, workdir, out_path, progress, opts):
     langs = [c for c in LANGS if opts.get("langs", {}).get(c)] or ["ta"]
-    _REF_EMB.clear(); _REF_BUZZ.clear(); _SPK_ANCHOR.clear()
+    _REF_EMB.clear(); _REF_BUZZ.clear(); _SPK_ANCHOR.clear(); _VS_LOG.clear()
     total, width, height = probe(src)
 
     progress("🎵 ஆடியோ எடுக்கிறேன்...", 2)
@@ -1636,6 +1652,7 @@ def pipeline(src, workdir, out_path, progress, opts):
                 subs=n_subs, tracks=tracks, mkv=mkv_path, mp4=mp4_path,
                 skipped=[LANGS[c][0] for c in skipped],
                 samples={r["code"]: [t for t in r["texts"] if t][:8] for r in results},
+                speakers=speaker_report(segs, spk_profile),
                 duration=int(total), width=width, height=height)
 
 
@@ -1883,6 +1900,8 @@ async def process_video(m: Message, status: Message, opts: dict):
             cap += "\n🎧 Audio: " + ", ".join(info["tracks"])
             if info["skipped"]:
                 cap += "\n⚠️ தவறிய மொழி: " + ", ".join(info["skipped"])
+            if info.get("speakers"):
+                cap += "\n👥 கேரக்டர்கள்:\n" + "\n".join(info["speakers"][:10])
             if info["subs"]:
                 cap += "\n💬 English subtitle உள்ளது"
             if info["mkv"]:
