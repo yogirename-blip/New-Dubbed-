@@ -26,12 +26,12 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 SOURCE_LANG = os.environ.get("SOURCE_LANG") or None   # ja / hi / en ... (காலியா விட்டா auto)
-NUM_STEP = int(os.environ.get("NUM_STEP", "32"))
+NUM_STEP = int(os.environ.get("NUM_STEP", "20"))       # குறைச்சா வேகம், கூட்டினா தரம்
 BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHARS_PER_SEC = 11.0                                  # பேச்சு வேகம் (எழுத்து/வினாடி)
 # code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
-BOT_VERSION = "2026-11-01-r11 (natural-voice)"
+BOT_VERSION = "2026-11-01-r12 (faster + ETA)"
 
 LANGS = {
     "ta": ("தமிழ்", "Tamil", "tam", "Tamil", 11.0),
@@ -1066,8 +1066,13 @@ def pipeline(src, workdir, out_path, progress, opts):
 
         track = np.zeros(int((total + 2) * sr), dtype=np.float32)
         failed = 0
+        t_loop = time.time()
         for i, s in enumerate(segs):
-            progress(f"🎙️ {lname} குரல் உருவாக்குறேன்... {i + 1}/{n_seg}",
+            eta = ""
+            if i >= 2:
+                left = (time.time() - t_loop) / i * (n_seg - i)
+                eta = f"  ⏳ ~{int(left // 60) + 1} நிமிடம் மீதம்"
+            progress(f"🎙️ {lname} குரல் உருவாக்குறேன்... {i + 1}/{n_seg}{eta}",
                      int(p0 + span * (0.1 + 0.9 * (i + 1) / n_seg)))
             text = (texts[i] or "").strip()
             if not text:
@@ -1085,7 +1090,7 @@ def pipeline(src, workdir, out_path, progress, opts):
                 wav = synth(text, ref_path, ref_text, lang=code)
                 semi = pitch_check(wav, sr, tgt_f0)
                 tries = 0
-                while abs(semi) > 6 and tries < 2:      # ஆண்/பெண் குரல் மாறிடுச்சு -> வேற seed-ல மறுபடி
+                while abs(semi) > 7 and tries < 1:      # ஆண்/பெண் குரல் மாறிடுச்சு -> வேற seed-ல மறுபடி
                     tries += 1
                     set_seed(base_seed + 17 * tries)
                     w2 = synth(text, ref_path, ref_text, lang=code)
