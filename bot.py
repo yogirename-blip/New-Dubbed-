@@ -31,7 +31,7 @@ BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHARS_PER_SEC = 11.0                                  # பேச்சு வேகம் (எழுத்து/வினாடி)
 # code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
-BOT_VERSION = "2026-11-01-r10 (speaker-embeddings)"
+BOT_VERSION = "2026-11-01-r11 (natural-voice)"
 
 LANGS = {
     "ta": ("தமிழ்", "Tamil", "tam", "Tamil", 11.0),
@@ -146,6 +146,7 @@ SR16 = 16000
 FX_GAIN = float(os.environ.get("FX_GAIN", "0.85"))     # அசல் சிரிப்பு/அலறல் சத்தம்
 SPK_THRESH = float(os.environ.get("SPK_THRESH", "20"))   # கூட்டினா = குறைவான ஆட்கள்
 SPK_MAX = int(os.environ.get("SPK_MAX", "3"))           # ஒரு பாலினத்துக்கு max ஆட்கள்
+PITCH_FIX = os.environ.get("PITCH_FIX", "0") == "1"
 LEAD = 0.05                                            # டப் குரல் கொஞ்சம் முன்னாடியே தொடங்க
 
 
@@ -382,28 +383,42 @@ def build_ref(i, segs, voc, vsr, words, refdir, tag="ref"):
 
 
 def build_profile(spk, segs, voc, vsr, words, refdir):
-    """ஒரு கேரக்டரோட 'குரல் அடையாளம்': அவரோட தெளிவான பல வசனங்கள் சேர்த்து ஒரே reference."""
+    """கேரக்டரோட 'குரல் அடையாளம்': அவரோட தெளிவான ஒரு நீளமான வசனம் (3-9 நொடி) -> ஒரே reference."""
     idx = [i for i, s in enumerate(segs) if s["speaker"] == spk]
     calm = [i for i in idx if not segs[i].get("delivery")]
+
+    def words_in(a, b):
+        return "".join(w for (st, en, w) in words if st >= a - 0.02 and en <= b + 0.02).strip()
+
+    def save(clip, text):
+        pk = float(np.max(np.abs(clip))) if len(clip) else 0.0
+        if pk > 1e-4:
+            clip = clip * (0.9 / pk)
+        path = os.path.join(refdir, f"profile_{spk}.wav")
+        sf.write(path, clip.astype(np.float32), vsr)
+        return path, (text or None)
+
     for pool in (calm, idx):
         pool = sorted(pool, key=lambda i: segs[i]["end"] - segs[i]["start"], reverse=True)
-        clips, texts, total = [], [], 0.0
-        gap = np.zeros(int(0.12 * vsr), dtype=np.float32)
+        for i in pool:                                    # ஒரே நீளமான clip
+            a, b = segs[i]["start"], min(segs[i]["end"], segs[i]["start"] + 9.0)
+            if b - a >= 2.5:
+                return save(voc[int(a * vsr):int(b * vsr)], words_in(a, b))
+        clips, texts, total = [], [], 0.0                 # இல்லன்னா சின்னதுகளை சேர்த்து
+        gap = np.zeros(int(0.15 * vsr), dtype=np.float32)
         for i in pool:
-            a, b = segs[i]["start"], min(segs[i]["end"], segs[i]["start"] + 6.0)
-            if b - a < 0.8:
+            a, b = segs[i]["start"], min(segs[i]["end"], segs[i]["start"] + 5.0)
+            if b - a < 0.6:
                 continue
             clips += [voc[int(a * vsr):int(b * vsr)], gap]
             total += b - a
-            t = "".join(w for (st, en, w) in words if st >= a - 0.02 and en <= b + 0.02).strip()
+            t = words_in(a, b)
             if t:
                 texts.append(t)
-            if total >= 10.0 or len(clips) >= 8:
+            if total >= 5.0:
                 break
         if total >= 1.0:
-            path = os.path.join(refdir, f"profile_{spk}.wav")
-            sf.write(path, np.concatenate(clips), vsr)
-            return path, (" ".join(texts) or None)
+            return save(np.concatenate(clips), " ".join(texts))
     return None, None
 
 
@@ -472,6 +487,7 @@ def add_slots(segs, total):
         slot = min(avail, dur * 1.6 + 0.4)
         slot = max(slot, min(dur, avail))
         s["slot"] = max(0.4, slot)
+        s["hard"] = max(s["slot"], avail)      # அடுத்த வசனம் தொடங்குற வரை overflow ஆகலாம்
 
 
 # ---------------------------------------------------------------- subtitles
@@ -925,19 +941,25 @@ def synth(text, ref_path, ref_text, duration=None, lang="ta"):
     return np.asarray(audio[0], dtype=np.float32)
 
 
-def fit_to_slot(wav, sr, slot, text, ref_path, ref_text, lang="ta", target_rms=None):
+def fit_to_slot(wav, sr, slot, text, ref_path, ref_text, lang="ta", target_rms=None, hard=None):
+    limit = max(slot, hard or slot)
     L = len(wav) / sr
-    if L > slot * 1.05:
-        try:
-            w2 = synth(text, ref_path, ref_text, duration=slot, lang=lang)
-            if len(w2) > 0:
-                wav = w2
-        except Exception as e:
-            log("duration regen failed:", repr(e))
-        L = len(wav) / sr
-        if L > slot:
-            rate = min(L / slot, 1.35)
+    # இயல்பான வேகத்துல பேசி, அடுத்த வசனம் தொடங்கும் முன் முடிஞ்சா போதும் (ரோபோ மாதிரி வேகப்படுத்தாம)
+    if L > limit:
+        rate = L / limit
+        if rate <= 1.15:
             wav = librosa.effects.time_stretch(wav, rate=rate)
+        else:
+            try:
+                w2 = synth(text, ref_path, ref_text, duration=limit * 0.97, lang=lang)
+                if len(w2) > 0:
+                    wav = w2
+            except Exception as e:
+                log("duration regen failed:", repr(e))
+            L = len(wav) / sr
+            if L > limit:
+                wav = librosa.effects.time_stretch(wav, rate=min(L / limit, 1.25))
+    slot = limit
     maxlen = int(slot * sr)
     if len(wav) > maxlen:
         wav = wav[:maxlen].copy()
@@ -1059,12 +1081,24 @@ def pipeline(src, workdir, out_path, progress, opts):
                 tgt_f0 = med_f0.get(s["speaker"]) or s.get("f0")
                 tgt_rms = s.get("rms")
                 set_seed(1000 + sum(ord(ch) for ch in s["speaker"]))
+                base_seed = 1000 + sum(ord(ch) for ch in s["speaker"])
                 wav = synth(text, ref_path, ref_text, lang=code)
                 semi = pitch_check(wav, sr, tgt_f0)
+                tries = 0
+                while abs(semi) > 6 and tries < 2:      # ஆண்/பெண் குரல் மாறிடுச்சு -> வேற seed-ல மறுபடி
+                    tries += 1
+                    set_seed(base_seed + 17 * tries)
+                    w2 = synth(text, ref_path, ref_text, lang=code)
+                    s2 = pitch_check(w2, sr, tgt_f0)
+                    if abs(s2) < abs(semi):
+                        wav, semi = w2, s2
+                if abs(semi) > 4:
+                    log(f"{code} seg {i} {s['speaker']}: pitch வித்தியாசம் {semi:.1f} semitone")
                 wav = trim_silence(wav, sr)
-                wav = fix_pitch(wav, sr, semi)
+                if PITCH_FIX:                            # pitch மாத்துனா குரல் ரோபோ ஆகும் - default off
+                    wav = fix_pitch(wav, sr, semi)
                 wav = fit_to_slot(wav, sr, s["slot"], text, ref_path, ref_text,
-                                  lang=code, target_rms=tgt_rms)
+                                  lang=code, target_rms=tgt_rms, hard=s.get("hard"))
                 a = int(max(0.0, s["start"] - LEAD) * sr)
                 b = min(a + len(wav), len(track))
                 track[a:b] += wav[:b - a]
