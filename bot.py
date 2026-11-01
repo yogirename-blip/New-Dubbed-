@@ -31,7 +31,7 @@ BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHARS_PER_SEC = 11.0                                  # பேச்சு வேகம் (எழுத்து/வினாடி)
 # code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
-BOT_VERSION = "2026-11-01-r9 (voice-lock + casual)"
+BOT_VERSION = "2026-11-01-r10 (speaker-embeddings)"
 
 LANGS = {
     "ta": ("தமிழ்", "Tamil", "tam", "Tamil", 11.0),
@@ -171,6 +171,88 @@ def voiced_f0(clip, sr=SR16, fmin=70, fmax=420):
     return float(np.median(f[ok]))
 
 
+_SPK_MODEL = None
+SPK_SIM = float(os.environ.get("SPK_SIM", "0.86"))        # இதுக்கு மேல ஒத்திருந்தா = அதே ஆள்
+SPK_MAX_TOTAL = int(os.environ.get("SPK_MAX_TOTAL", "8"))
+
+
+def _load_spk_model():
+    """உண்மையான speaker-embedding model (WavLM x-vector) - ஆள் குரல் தன்மையை பிடிக்கும்."""
+    global _SPK_MODEL
+    if _SPK_MODEL is None:
+        from transformers import AutoFeatureExtractor, WavLMForXVector
+        name = "microsoft/wavlm-base-plus-sv"
+        fe = AutoFeatureExtractor.from_pretrained(name)
+        m = WavLMForXVector.from_pretrained(name).to(DEVICE).float().eval()
+        _SPK_MODEL = (fe, m)
+    return _SPK_MODEL
+
+
+def seg_embeddings(segs, voc16):
+    fe, m = _load_spk_model()
+    embs = []
+    for s in segs:
+        clip = voc16[int(s["start"] * SR16):int(min(s["end"], s["start"] + 8.0) * SR16)]
+        if len(clip) < SR16 * 0.6:
+            embs.append(None)
+            continue
+        inp = fe(clip, sampling_rate=SR16, return_tensors="pt", padding=True)
+        with torch.no_grad():
+            e = m(**{k: v.to(DEVICE) for k, v in inp.items()}).embeddings
+        e = torch.nn.functional.normalize(e, dim=-1)[0].float().cpu().numpy()
+        embs.append(e)
+    return embs
+
+
+def cluster_embeddings(embs, thr):
+    """cosine ஒத்துமை அடிப்படையில ஆட்களை பிரிக்குது (எத்தனை பேர்னு முன்னாடியே தேவையில்ல)."""
+    idx = [i for i, e in enumerate(embs) if e is not None]
+    members = [[i] for i in idx]
+    cent = [embs[i].copy() for i in idx]
+    best_pair_sim = None
+    while len(members) > 1:
+        C = np.stack([c / (np.linalg.norm(c) + 1e-9) for c in cent])
+        S = C @ C.T
+        np.fill_diagonal(S, -1.0)
+        x, y = np.unravel_index(int(np.argmax(S)), S.shape)
+        best_pair_sim = float(S[x, y])
+        if best_pair_sim < thr and len(members) <= SPK_MAX_TOTAL:
+            break
+        if x > y:
+            x, y = y, x
+        members[x] += members[y]
+        cent[x] = np.mean([embs[i] for i in members[x]], axis=0)
+        del members[y], cent[y]
+    return members, best_pair_sim
+
+
+def embed_speakers(segs, voc16, gender):
+    embs = seg_embeddings(segs, voc16)
+    members, nxt = cluster_embeddings(embs, SPK_SIM)
+    if not members:
+        return None
+    label = {}
+    for k, mem in enumerate(members):
+        for i in mem:
+            label[i] = k
+    known = sorted(label)
+    for i in range(len(segs)):               # chinna வசனங்களுக்கு பக்கத்துல இருக்கிறவங்க label
+        if i not in label:
+            label[i] = label[min(known, key=lambda j: abs(j - i))]
+    spk, count = [None] * len(segs), {"M": 0, "F": 0}
+    names = {}
+    for k in sorted(set(label.values())):
+        gs = [gender[i] for i in range(len(segs)) if label[i] == k]
+        g = "F" if gs.count("female") > len(gs) / 2 else "M"
+        names[k] = f"{g}{count[g]}"
+        count[g] += 1
+    for i in range(len(segs)):
+        spk[i] = names[label[i]]
+        gender[i] = "female" if spk[i][0] == "F" else "male"
+    log(f"speaker embeddings: {len(members)} ஆட்கள் (next-closest sim {nxt if nxt is None else round(nxt, 3)})")
+    return spk
+
+
 def assign_speakers(segs, voc16):
     """ஆண்/பெண் + ஆளை (speaker) கண்டுபிடிக்கும் (pitch + MFCC clustering)."""
     mfs, f0s = [], []
@@ -206,30 +288,36 @@ def assign_speakers(segs, voc16):
             near = [gender[j] for j in range(len(gender)) if gender[j] and abs(j - i) <= 3]
             gender[i] = near[0] if near else "male"
 
-    spk = [None] * len(segs)
-    for g in ("male", "female"):
-        idx = [i for i in range(len(segs)) if gender[i] == g]
-        labels = {i: 0 for i in idx}
-        withmf = [i for i in idx if mfs[i] is not None]
-        if len(withmf) >= 4:
-            try:
-                from sklearn.cluster import AgglomerativeClustering
-                X = np.array([mfs[i] for i in withmf])
-                X = (X - X.mean(0)) / (X.std(0) + 1e-6)
-                cl = AgglomerativeClustering(n_clusters=None, distance_threshold=SPK_THRESH,
-                                             linkage="ward").fit(X)
-                if cl.n_clusters_ > SPK_MAX:
-                    cl = AgglomerativeClustering(n_clusters=SPK_MAX, linkage="ward").fit(X)
-                for i, lab in zip(withmf, cl.labels_):
-                    labels[i] = int(lab)
-                for i in idx:                  # MFCC இல்லாததுக்கு பக்கத்து label
-                    if mfs[i] is None:
-                        nb = [labels[j] for j in withmf if abs(j - i) <= 3]
-                        labels[i] = nb[0] if nb else 0
-            except Exception as e:
-                log("speaker clustering skip:", repr(e)[:100])
-        for i in idx:
-            spk[i] = f"{'F' if g == 'female' else 'M'}{labels[i]}"
+    spk = None
+    try:
+        spk = embed_speakers(segs, voc16, gender)
+    except Exception as e:
+        log("speaker embedding failed, MFCC fallback:", repr(e)[:150])
+    if spk is None:
+        spk = [None] * len(segs)
+        for g in ("male", "female"):
+            idx = [i for i in range(len(segs)) if gender[i] == g]
+            labels = {i: 0 for i in idx}
+            withmf = [i for i in idx if mfs[i] is not None]
+            if len(withmf) >= 4:
+                try:
+                    from sklearn.cluster import AgglomerativeClustering
+                    X = np.array([mfs[i] for i in withmf])
+                    X = (X - X.mean(0)) / (X.std(0) + 1e-6)
+                    cl = AgglomerativeClustering(n_clusters=None, distance_threshold=SPK_THRESH,
+                                                 linkage="ward").fit(X)
+                    if cl.n_clusters_ > SPK_MAX:
+                        cl = AgglomerativeClustering(n_clusters=SPK_MAX, linkage="ward").fit(X)
+                    for i, lab in zip(withmf, cl.labels_):
+                        labels[i] = int(lab)
+                    for i in idx:                  # MFCC இல்லாததுக்கு பக்கத்து label
+                        if mfs[i] is None:
+                            nb = [labels[j] for j in withmf if abs(j - i) <= 3]
+                            labels[i] = nb[0] if nb else 0
+                except Exception as e:
+                    log("speaker clustering skip:", repr(e)[:100])
+            for i in idx:
+                spk[i] = f"{'F' if g == 'female' else 'M'}{labels[i]}"
     for i, s in enumerate(segs):
         s["speaker"], s["gender"] = spk[i], gender[i]
     log("speakers:", sorted(set(spk)))
