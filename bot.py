@@ -31,6 +31,8 @@ BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHARS_PER_SEC = 11.0                                  # பேச்சு வேகம் (எழுத்து/வினாடி)
 # code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
+BOT_VERSION = "2026-11-01-r9 (voice-lock + casual)"
+
 LANGS = {
     "ta": ("தமிழ்", "Tamil", "tam", "Tamil", 11.0),
     "te": ("தெலுங்கு", "Telugu", "tel", "Telugu", 11.0),
@@ -142,6 +144,8 @@ def transcribe(vocals_path):
 # ---------------------------------------------------------------- speakers / voice analysis
 SR16 = 16000
 FX_GAIN = float(os.environ.get("FX_GAIN", "0.85"))     # அசல் சிரிப்பு/அலறல் சத்தம்
+SPK_THRESH = float(os.environ.get("SPK_THRESH", "20"))   # கூட்டினா = குறைவான ஆட்கள்
+SPK_MAX = int(os.environ.get("SPK_MAX", "3"))           # ஒரு பாலினத்துக்கு max ஆட்கள்
 LEAD = 0.05                                            # டப் குரல் கொஞ்சம் முன்னாடியே தொடங்க
 
 
@@ -212,10 +216,10 @@ def assign_speakers(segs, voc16):
                 from sklearn.cluster import AgglomerativeClustering
                 X = np.array([mfs[i] for i in withmf])
                 X = (X - X.mean(0)) / (X.std(0) + 1e-6)
-                cl = AgglomerativeClustering(n_clusters=None, distance_threshold=14.0,
+                cl = AgglomerativeClustering(n_clusters=None, distance_threshold=SPK_THRESH,
                                              linkage="ward").fit(X)
-                if cl.n_clusters_ > 3:
-                    cl = AgglomerativeClustering(n_clusters=3, linkage="ward").fit(X)
+                if cl.n_clusters_ > SPK_MAX:
+                    cl = AgglomerativeClustering(n_clusters=SPK_MAX, linkage="ward").fit(X)
                 for i, lab in zip(withmf, cl.labels_):
                     labels[i] = int(lab)
                 for i in idx:                  # MFCC இல்லாததுக்கு பக்கத்து label
@@ -287,6 +291,32 @@ def build_ref(i, segs, voc, vsr, words, refdir, tag="ref"):
     path = os.path.join(refdir, f"{tag}_{i}.wav")
     sf.write(path, clip, vsr)
     return path, (" ".join(texts) or None)
+
+
+def build_profile(spk, segs, voc, vsr, words, refdir):
+    """ஒரு கேரக்டரோட 'குரல் அடையாளம்': அவரோட தெளிவான பல வசனங்கள் சேர்த்து ஒரே reference."""
+    idx = [i for i, s in enumerate(segs) if s["speaker"] == spk]
+    calm = [i for i in idx if not segs[i].get("delivery")]
+    for pool in (calm, idx):
+        pool = sorted(pool, key=lambda i: segs[i]["end"] - segs[i]["start"], reverse=True)
+        clips, texts, total = [], [], 0.0
+        gap = np.zeros(int(0.12 * vsr), dtype=np.float32)
+        for i in pool:
+            a, b = segs[i]["start"], min(segs[i]["end"], segs[i]["start"] + 6.0)
+            if b - a < 0.8:
+                continue
+            clips += [voc[int(a * vsr):int(b * vsr)], gap]
+            total += b - a
+            t = "".join(w for (st, en, w) in words if st >= a - 0.02 and en <= b + 0.02).strip()
+            if t:
+                texts.append(t)
+            if total >= 10.0 or len(clips) >= 8:
+                break
+        if total >= 1.0:
+            path = os.path.join(refdir, f"profile_{spk}.wav")
+            sf.write(path, np.concatenate(clips), vsr)
+            return path, (" ".join(texts) or None)
+    return None, None
 
 
 def pitch_check(wav, sr, target_f0, tol_semi=3.5):
@@ -473,6 +503,12 @@ STYLE = {
            "adverbs end in -ா (சரியா, சீக்கிரமா), and avoids passive -ப்படும் (use active). "
            "[scene] 'They are trying to open the door to the underworld.' -> "
            "'அவங்க பாதாள உலகத்துக்கு கதவ தொறக்க பாக்குறாங்க.'\n"
+           "Do NOT translate sentence by sentence like a textbook. Say it the way a real person says it "
+           "in daily life: drop obvious subjects, trail off, keep it short and a bit rough, avoid stiff "
+           "full sentences and stiff words like இங்கே/அங்கே (say இங்க/அங்க). "
+           "[casual] 'Let them stay there.' -> 'அவங்க அங்கயே இருக்கட்டும் விடு.'\n"
+           "[casual] 'There is no need for you to come.' -> 'நீ வர வேணாம் விடு.'\n"
+           "[casual] 'Where did you go all this time?' -> 'இவ்ளோ நேரம் எங்க போன?'\n"
            "Always use these casual verb forms: பண்ணுறேன்/பண்ணுற/பண்ணுறீங்க, சாப்பிட்டியா, "
            "வர்றேன், போறேன், சொல்றேன், பார்க்குறேன். Never write செய்கிறேன்/வருகிறேன்/சாப்பிட்டாயா."),
     "te": ("Use everyday colloquial spoken Telugu (వ్యావహారిక భాష) like friends talking, "
@@ -591,6 +627,9 @@ _WORDS = {
     "பேசுகிறீர்கள்": "பேசுறீங்க", "பேசுகிறார்கள்": "பேசுறாங்க",
 }
 _WORDS.update({
+    "இங்கே": "இங்க", "அங்கே": "அங்க", "எங்கே": "எங்க", "இங்கேயே": "இங்கயே",
+    "அங்கேயே": "அங்கயே", "எங்கேயும்": "எங்கயும்", "இங்கேயும்": "இங்கயும்",
+    "அங்கேயும்": "அங்கயும்", "என்னவென்று": "என்னன்னு", "ஏனெனில்": "ஏன்னா",
     "திறக்க": "தொறக்க", "திறந்து": "தொறந்து", "திறக்கும்": "தொறக்கும்", "திறந்த": "தொறந்த",
     "வேறு": "வேற", "அல்லது": "இல்லனா", "மீண்டும்": "மறுபடியும்", "நிச்சயமாக": "கண்டிப்பா",
     "செய்வது": "பண்றது", "போவது": "போறது", "வருவது": "வர்றது", "சொல்வது": "சொல்றது",
@@ -647,6 +686,7 @@ def _verb_sub(m):
 
 _ENDINGS = [   # வினை முடிவுகள் (suffix)
     ("ட்டாயா", "ட்டியா"), ("ந்தாயா", "ந்தியா"), ("ட்டீர்களா", "ட்டீங்களா"),
+    ("னாய்", "ன"), ("ந்தாய்", "ந்த"), ("ட்டாய்", "ட்ட"),
     ("ருக்கிறேன்", "ருக்கேன்"), ("ருக்கிறோம்", "ருக்கோம்"), ("ருக்கிறாய்", "ருக்க"),
     ("ருக்கிறீர்கள்", "ருக்கீங்க"), ("ருக்கிறார்கள்", "ருக்காங்க"),
     ("ருக்கிறார்", "ருக்காரு"), ("ருக்கிறாள்", "ருக்கா"), ("ருக்கிறான்", "ருக்கான்"),
@@ -773,7 +813,19 @@ def make_ref(i, s, voc, vsr, words, total, refdir):
     return path, (text or None)
 
 
+_SEED = None
+
+
+def set_seed(v):
+    global _SEED
+    _SEED = v
+
+
 def synth(text, ref_path, ref_text, duration=None, lang="ta"):
+    if _SEED is not None:                    # அதே ஆளுக்கு எப்போவும் அதே குரல் வர
+        torch.manual_seed(_SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(_SEED)
     kw = dict(text=text, language=lang, num_step=NUM_STEP, pad_duration=0.0)
     if ref_path:
         kw["ref_audio"] = ref_path
@@ -861,13 +913,10 @@ def pipeline(src, workdir, out_path, progress, opts):
     refdir = os.path.join(workdir, "refs")
     os.makedirs(refdir, exist_ok=True)
     refs = [build_ref(i, segs, voc, vsr, words, refdir) for i, s in enumerate(segs)]
-    # ஒவ்வொரு ஆளுக்கும் சிறந்த (நீளமான) reference - வசனத்தோட ref தப்பா இருந்தா மாத்த
-    best = {}
-    for i, s in enumerate(segs):
-        if refs[i][0] and (s["speaker"] not in best
-                           or s["end"] - s["start"] > segs[best[s["speaker"]]]["end"] - segs[best[s["speaker"]]]["start"]):
-            best[s["speaker"]] = i
-    spk_ref = {k: build_ref(i, segs, voc, vsr, words, refdir, tag="best") for k, i in best.items()}
+    # ஒவ்வொரு கேரக்டருக்கும் ஒரே 'குரல் அடையாளம்' -> எல்லா வசனத்துலயும் அதே குரல்
+    spk_profile = {k: build_profile(k, segs, voc, vsr, words, refdir)
+                   for k in sorted({x["speaker"] for x in segs})}
+    log("voice profiles:", {k: bool(v[0]) for k, v in spk_profile.items()})
 
     sr = OMNI.sampling_rate
     base_path = bg if bg else audio
@@ -916,18 +965,14 @@ def pipeline(src, workdir, out_path, progress, opts):
                 failed += 1
                 continue
             try:
-                ref_path, ref_text = refs[i]
-                tgt_f0 = s.get("f0") or med_f0.get(s["speaker"])
+                ref_path, ref_text = spk_profile.get(s["speaker"]) or (None, None)
+                if not ref_path:
+                    ref_path, ref_text = refs[i]
+                tgt_f0 = med_f0.get(s["speaker"]) or s.get("f0")
                 tgt_rms = s.get("rms")
+                set_seed(1000 + sum(ord(ch) for ch in s["speaker"]))
                 wav = synth(text, ref_path, ref_text, lang=code)
                 semi = pitch_check(wav, sr, tgt_f0)
-                if abs(semi) > 6 and spk_ref.get(s["speaker"], (None, None))[0] not in (None, ref_path):
-                    # ஆண்/பெண் குரல் மாறிடுச்சு -> அந்த ஆளோட சிறந்த reference-ல மறுபடி
-                    br, bt = spk_ref[s["speaker"]]
-                    w2 = synth(text, br, bt, lang=code)
-                    semi2 = pitch_check(w2, sr, tgt_f0)
-                    if abs(semi2) < abs(semi):
-                        wav, semi, ref_path, ref_text = w2, semi2, br, bt
                 wav = trim_silence(wav, sr)
                 wav = fix_pitch(wav, sr, semi)
                 wav = fit_to_slot(wav, sr, s["slot"], text, ref_path, ref_text,
@@ -1043,7 +1088,13 @@ def pipeline(src, workdir, out_path, progress, opts):
 async def start_cmd(_, m: Message):
     await m.reply_text(
         "வணக்கம்! 🎬\nவீடியோவை அனுப்பு. அதே கேரக்டர் குரலில், அதே நேரத்தில் "
-        "தமிழ் டப்பிங் பண்ணி தருகிறேன்.\nநேரம் ஆகலாம், பொறுமையா காத்திரு.")
+        "தமிழ் டப்பிங் பண்ணி தருகிறேன்.\nநேரம் ஆகலாம், பொறுமையா காத்திரு.\n"
+        f"🔖 Version: {BOT_VERSION}")
+
+
+@app.on_message(filters.command("version") & filters.private)
+async def version_cmd(_, m: Message):
+    await m.reply_text(f"🔖 Bot version: {BOT_VERSION}")
 
 
 PENDING = {}
@@ -1169,7 +1220,7 @@ async def process_video(m: Message, status: Message, opts: dict):
             try:
                 lines = []
                 for code, arr in info["samples"].items():
-                    lines.append(f"📝 {LANGS[code][0]} வசனங்கள் (மாதிரி):")
+                    lines.append(f"📝 {LANGS[code][0]} வசனங்கள் (மாதிரி)  🔖 {BOT_VERSION}:")
                     lines += [f"{k + 1}. {t}" for k, t in enumerate(arr)]
                     lines.append("")
                 if lines:
@@ -1195,7 +1246,7 @@ async def main():
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080))).start()
     await app.start()
-    log("Bot started")
+    log("Bot started | version:", BOT_VERSION)
     await asyncio.Event().wait()
 
 
