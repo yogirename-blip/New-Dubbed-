@@ -1,7 +1,7 @@
 """
-Tamil Dub Telegram Bot
-======================
-Telegram-la video anuppunga -> bot Tamil-la dub panni thirumba anuppum.
+Multi-language Dub Telegram Bot (Tamil / Telugu / Malayalam / Kannada / Hindi)
+=============================================================================
+Telegram-la video anuppunga -> mozhi(galai) button-la thervu pannunga -> bot dub panni ORE video-va anuppum.
 
 Secrets (Kaggle -> Add-ons -> Secrets):
   GEMINI_API_KEY      aistudio.google.com/apikey
@@ -98,9 +98,9 @@ def bar(pct, n=10):
 
 
 class Job:
-    def __init__(self, event, fmt, send):
+    def __init__(self, event, fmt, send, langs):
         self.id = next(_ids)
-        self.event, self.fmt, self.send = event, fmt, send
+        self.event, self.fmt, self.send, self.langs = event, fmt, send, list(langs)
         self.chat_id, self.user_id = event.chat_id, event.sender_id
         self.cancel = threading.Event()      # tamil_dub idhai paarkkum
         self.task = None                     # download / upload asyncio task
@@ -130,31 +130,68 @@ async def render(job, final=None):
             await asyncio.sleep(5)
 
 
-SETTINGS = {}  # user_id -> {"fmt": "mp4|mkv", "send": "video|document"}
+SETTINGS = {}  # user_id -> {"fmt": "mp4|mkv", "send": "video|document", "langs": [...]}
+PENDING = {}   # panel_id -> {"event", "user_id", "langs", "fmt", "send", "panel", "ts"}
+_pids = itertools.count(1)
+LANG_BTN = [("ta", "தமிழ்"), ("te", "తెలుగు"), ("ml", "മലയാളം"), ("kn", "ಕನ್ನಡ"), ("hi", "हिन्दी")]
+LANG_ORDER = [c for c, _ in LANG_BTN]
+LANG_NAME = dict(LANG_BTN)
 
 
 def prefs(uid):
-    return SETTINGS.setdefault(uid, {"fmt": "mp4", "send": "video"})
+    return SETTINGS.setdefault(uid, {"fmt": "mp4", "send": "video", "langs": ["ta"]})
 
 
-def describe(p):
-    send = "document (file)" if p["send"] == "document" or p["fmt"] == "mkv" else "video"
-    return f"Format: {p['fmt'].upper()} | அனுப்பும் முறை: {send}"
+def eff_fmt(pd):
+    return "mkv" if len(pd["langs"]) > 1 else pd["fmt"]          # pala mozhi -> orey MKV (ella audio track-um ullae)
 
 
-@client.on(events.NewMessage(pattern=r"^/(mp4|mkv|video|document|settings)"))
-async def set_pref(event):
-    cmd = event.raw_text.split()[0].lstrip("/").split("@")[0].lower()
-    p = prefs(event.sender_id)
-    if cmd in ("mp4", "mkv"):
-        p["fmt"] = cmd
-    elif cmd in ("video", "document"):
-        p["send"] = cmd
-    extra = ""
-    if p["fmt"] == "mkv":
-        extra = "\n(MKV: தமிழ் + அசல் ஆடியோ இரண்டு track இருக்கும். Telegram-ல் file-ஆகத்தான் போகும்.)"
-    await event.reply("✅ " + describe(p) + extra +
-                      "\n\nமாற்ற: /mp4 /mkv /video /document")
+def eff_send(pd):
+    return "document" if eff_fmt(pd) == "mkv" else pd["send"]
+
+
+def describe(fmt, send, langs):
+    names = " + ".join(LANG_NAME[l] for l in LANG_ORDER if l in langs)
+    snd = "file (document)" if send == "document" or fmt == "mkv" else "video"
+    return f"மொழி: {names}\nFormat: {fmt.upper()} | அனுப்பும் முறை: {snd}"
+
+
+def panel_text(pd):
+    langs = pd["langs"]
+    t = "🎬 வீடியோ கிடைத்தது ✅\n\n🌐 எந்த மொழியில் dub வேணும்? (ஒண்ணு அல்லது பல தேர்ந்தெடுங்க)\n\n"
+    t += describe(eff_fmt(pd), eff_send(pd), langs)
+    if len(langs) > 1:
+        t += ("\n\n📦 பல மொழி தேர்ந்ததால், எல்லா மொழி audio-வும் ஒரே MKV வீடியோவுக்குள்ள "
+              "தனித்தனி track-ஆ இருக்கும். Player-ல (MX Player / VLC) audio track மாத்தி கேட்கலாம்.")
+    t += "\n\nதேர்ந்ததும் 🚀 தொடங்கு அழுத்துங்க."
+    return t
+
+
+def panel_buttons(pid, pd):
+    def tick(on):
+        return "✅ " if on else "⬜ "
+
+    def b(label, data):
+        return Button.inline(label, data=data.encode())
+    langs = pd["langs"]
+    btn = [LANG_BTN[:3], LANG_BTN[3:]]
+    rows = [[b(tick(c in langs) + n, f"sel:{pid}:{c}") for c, n in row] for row in btn]
+    rows[1].append(b(tick(len(langs) == len(LANG_BTN)) + "எல்லாம்", f"sel:{pid}:all"))
+    f = eff_fmt(pd)
+    rows.append([b(tick(f == "mp4") + "MP4", f"fmt:{pid}:mp4"), b(tick(f == "mkv") + "MKV", f"fmt:{pid}:mkv")])
+    s = eff_send(pd)
+    rows.append([b(tick(s == "video") + "🎞 Video", f"snd:{pid}:video"),
+                 b(tick(s == "document") + "📁 File", f"snd:{pid}:document")])
+    rows.append([b("🚀 தொடங்கு", f"go:{pid}"), b("❌ ரத்து", f"x:{pid}")])
+    return rows
+
+
+async def refresh_panel(pd, pid):
+    try:
+        await pd["panel"].edit(panel_text(pd), buttons=panel_buttons(pid, pd))
+    except Exception as e:  # noqa
+        if "not modified" not in str(e).lower():
+            print("panel edit fail:", str(e)[:120])
 
 
 def is_video(msg):
@@ -166,14 +203,22 @@ def is_video(msg):
 
 @client.on(events.NewMessage(pattern="/start"))
 async def start(event):
-    await event.reply("வணக்கம்! 🎬 ஒரு வீடியோ அனுப்புங்க, நான் அதை பேச்சுத் தமிழில் dub செய்து திருப்பி அனுப்புறேன்.\n"
-                      "(நீளமான வீடியோவுக்கு நேரம் ஆகும். ஒரு நேரத்தில் ஒரு வீடியோ மட்டும்.)\n\n"
-                      "வடிவம் மாற்ற: /mp4 /mkv   |   அனுப்பும் முறை: /video /document   |   /settings")
+    await event.reply("வணக்கம்! 🎬 ஒரு வீடியோ அனுப்புங்க.\n"
+                      "அப்புறம் வர்ற பட்டன்களில் மொழி (தமிழ் / తెలుగు / മലയാളം / ಕನ್ನಡ / हिन्दी) தேர்ந்தெடுத்து 🚀 தொடங்கு அழுத்துங்க.\n"
+                      "ஒண்ணுக்கு மேல தேர்ந்தா எல்லாம் ஒரே வீடியோவுல (பல audio track) வரும்.\n\n"
+                      "ஒரு நேரத்தில் ஒரு வீடியோ மட்டும். நீளமான வீடியோவுக்கு நேரம் ஆகும்.")
 
 
 @client.on(events.NewMessage(pattern="/id"))
 async def my_id(event):
     await event.reply(f"உங்க ID: {event.sender_id}")
+
+
+@client.on(events.NewMessage(pattern=r"^/settings"))
+async def settings_cmd(event):
+    p = prefs(event.sender_id)
+    await event.reply("⚙️ கடைசியா தேர்ந்தது:\n" + describe(p["fmt"], p["send"], p["langs"]) +
+                      "\n\nஒவ்வொரு வீடியோ அனுப்பும்போதும் பட்டன்ல மாத்திக்கலாம்.")
 
 
 @client.on(events.NewMessage(func=lambda e: e.file is not None))
@@ -185,16 +230,87 @@ async def on_file(event):
         await event.reply("வீடியோ file மட்டும் அனுப்புங்க.")
         return
     remember_user(event.chat_id)
+    for k in [k for k, v in PENDING.items() if time.time() - v["ts"] > 3600]:
+        PENDING.pop(k, None)                       # 1 mani neram thodaadha panel-gal neekkum
     p = prefs(event.sender_id)
-    cap = (event.raw_text or "").lower()          # caption-la 'mkv' / 'doc' ezhuthina adhu mudhal
-    fmt = "mkv" if "mkv" in cap else ("mp4" if "mp4" in cap else p["fmt"])
-    send = "document" if ("doc" in cap or "file" in cap) else p["send"]
-    job = Job(event, fmt, send)
-    event.job_fmt, event.job_send = fmt, send
+    pid = next(_pids)
+    pd = {"event": event, "user_id": event.sender_id, "langs": list(p["langs"]) or ["ta"],
+          "fmt": p["fmt"], "send": p["send"], "ts": time.time()}
+    pd["panel"] = await event.reply(panel_text(pd), buttons=panel_buttons(pid, pd))
+    PENDING[pid] = pd
+
+
+def _owner_ok(event, pd):
+    return event.sender_id == pd["user_id"] or (ALLOWED and event.sender_id in ALLOWED)
+
+
+@client.on(events.CallbackQuery(pattern=rb"(sel|fmt|snd|go|x):(\d+)(?::(\w+))?"))
+async def on_panel(event):
+    kind = event.data_match.group(1).decode()
+    pid = int(event.data_match.group(2))
+    arg = (event.data_match.group(3) or b"").decode()
+    pd = PENDING.get(pid)
+    if not pd:
+        await event.answer("இந்த தேர்வு காலாவதி ஆயிடுச்சு. வீடியோவை மறுபடி அனுப்புங்க.", alert=True)
+        return
+    if not _owner_ok(event, pd):
+        await event.answer("இது உங்க வீடியோ இல்ல.", alert=True)
+        return
+    if kind == "x":
+        PENDING.pop(pid, None)
+        try:
+            await pd["panel"].edit("🛑 ரத்து செய்யப்பட்டது. புது வீடியோ அனுப்பலாம்.", buttons=None)
+        except Exception:  # noqa
+            pass
+        await event.answer("ரத்து")
+        return
+    if kind == "sel":
+        if arg == "all":
+            pd["langs"] = list(LANG_ORDER) if len(pd["langs"]) < len(LANG_ORDER) else ["ta"]
+        elif arg in LANG_NAME:
+            if arg in pd["langs"]:
+                if len(pd["langs"]) == 1:
+                    await event.answer("குறைந்தது ஒரு மொழி வேணும்.", alert=False)
+                    return
+                pd["langs"].remove(arg)
+            else:
+                pd["langs"].append(arg)
+            pd["langs"] = [c for c in LANG_ORDER if c in pd["langs"]]
+        await event.answer()
+        await refresh_panel(pd, pid)
+        return
+    if kind == "fmt":
+        if len(pd["langs"]) > 1 and arg == "mp4":
+            await event.answer("பல மொழிக்கு MKV தான் (ஒரே file-ல எல்லா audio track).", alert=True)
+            return
+        pd["fmt"] = arg if arg in ("mp4", "mkv") else pd["fmt"]
+        await event.answer()
+        await refresh_panel(pd, pid)
+        return
+    if kind == "snd":
+        if eff_fmt(pd) == "mkv" and arg == "video":
+            await event.answer("MKV Telegram-ல file-ஆ தான் போகும்.", alert=True)
+            return
+        pd["send"] = arg if arg in ("video", "document") else pd["send"]
+        await event.answer()
+        await refresh_panel(pd, pid)
+        return
+    # ---- go ----
+    PENDING.pop(pid, None)
+    fmt, send, langs = eff_fmt(pd), eff_send(pd), list(pd["langs"])
+    p = prefs(pd["user_id"])
+    p["fmt"], p["send"], p["langs"] = pd["fmt"], pd["send"], langs
+    ev = pd["event"]
+    job = Job(ev, fmt, send, langs)
     JOBS[job.id] = job
     pos = queue.qsize() + (1 if ACTIVE["job"] else 0) + 1
-    job.msg = f"வீடியோ கிடைத்தது ✅ வரிசை எண்: {pos}\n{describe({'fmt': fmt, 'send': send})}"
-    job.status = await event.reply(job.msg + f"\n\n{bar(0)}", buttons=job.buttons())
+    job.msg = f"வரிசை எண்: {pos}\n{describe(fmt, send, langs)}"
+    job.status = pd["panel"]
+    await event.answer("தொடங்குது 🚀")
+    try:
+        await job.status.edit(job.msg + f"\n\n{bar(0)}", buttons=job.buttons())
+    except Exception:  # noqa
+        job.status = await ev.reply(job.msg + f"\n\n{bar(0)}", buttons=job.buttons())
     write_state()
     await queue.put(job)
 
@@ -300,7 +416,7 @@ async def worker():
                     job.msg = msg
                 job.pct = max(job.pct, pct)
 
-            out = await asyncio.to_thread(tamil_dub.dub, src, folder, progress, job.fmt, job.cancel)
+            out = await asyncio.to_thread(tamil_dub.dub, src, folder, progress, job.fmt, job.cancel, job.langs)
             if job.cancel.is_set():
                 raise tamil_dub.Cancelled("cancelled")
             job.msg, job.pct = "📤 அனுப்புறேன்...", 98
@@ -313,7 +429,7 @@ async def worker():
             if os.path.getsize(out) > 1_990_000_000:
                 as_doc = True
                 await say(event, "⚠️ Output 2GB-ku mela irukku, Telegram-la anuppa mudiyaama pogalaam.")
-            await run_task(job, client.send_file(event.chat_id, out, caption="தமிழ் dub 🎧",
+            await run_task(job, client.send_file(event.chat_id, out, caption=" + ".join(LANG_NAME[l] for l in LANG_ORDER if l in job.langs) + " dub 🎧",
                                                  force_document=as_doc, supports_streaming=not as_doc,
                                                  reply_to=event.id, progress_callback=up_prog))
             stop.set(); await tick
