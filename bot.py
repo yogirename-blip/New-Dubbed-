@@ -37,7 +37,7 @@ BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHARS_PER_SEC = 11.0                                  # பேச்சு வேகம் (எழுத்து/வினாடி)
 # code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
-BOT_VERSION = "2026-11-02-r21 (IndicF5 no-TF/JAX fix)"
+BOT_VERSION = "2026-11-02-r22 (IndicF5 full-line + clean text)"
 NATURAL_TAMIL_MODE = os.environ.get("NATURAL_TAMIL_MODE", "cinema_anime_character").strip().lower()
 REVIEW_TIMEOUT = int(os.environ.get("REVIEW_TIMEOUT", "1200"))
 MANUAL_REVIEW = os.environ.get("MANUAL_REVIEW", "0") == "1"   # 1 போட்டா மட்டும் கையால் review
@@ -1169,6 +1169,15 @@ def set_seed(v):
     _SEED = v
 
 
+def clean_for_indic(text):
+    """தமிழ் வரியில ஆங்கிலம்/ஹிந்தி/ஜப்பானீஸ் எழுத்து இருந்தா மாடல் அந்த மொழியில பேசிடும் -> நீக்கு."""
+    t = re.sub(r"[A-Za-z\u0900-\u097F\u3040-\u30FF\u4E00-\u9FFF]+", " ", text or "")
+    t = re.sub(r"\s+", " ", t).strip()
+    if t and t[-1] not in ".!?…":
+        t += "."                                  # முடிவு குறி இருந்தா வாக்கியம் முழுசா முடியும்
+    return t or (text or "")
+
+
 def synth(text, ref_path, ref_text, duration=None, lang="ta"):
     if _SEED is not None:                    # அதே ஆளுக்கு எப்போவும் அதே குரல் வர
         torch.manual_seed(_SEED)
@@ -1178,7 +1187,7 @@ def synth(text, ref_path, ref_text, duration=None, lang="ta"):
         # IndicF5-க்கு duration/language parameter இல்ல; நேரம் பொருத்துறத fit_to_slot பாத்துக்கும்
         if not ref_path:
             raise RuntimeError("IndicF5-க்கு reference குரல் வேணும்")
-        return OMNI(text, ref_path, ref_text)
+        return OMNI(clean_for_indic(text), ref_path, ref_text)
     kw = dict(text=text, language=lang, num_step=NUM_STEP, pad_duration=0.0)
     if ref_path:
         kw["ref_audio"] = ref_path
@@ -1209,7 +1218,7 @@ def fit_to_slot(wav, sr, slot, text, ref_path, ref_text, lang="ta", target_rms=N
         if rate <= 1.15:
             wav = librosa.effects.time_stretch(wav, rate=rate)
         elif ACTIVE_TTS == "indicf5":              # IndicF5-ல duration இல்ல -> மெதுவா மட்டும் வேகப்படுத்து
-            wav = librosa.effects.time_stretch(wav, rate=min(rate, 1.25))
+            wav = librosa.effects.time_stretch(wav, rate=min(rate, 1.35))
         else:
             try:
                 w2 = synth(text, ref_path, ref_text, duration=limit * 0.97, lang=lang)
@@ -1221,7 +1230,7 @@ def fit_to_slot(wav, sr, slot, text, ref_path, ref_text, lang="ta", target_rms=N
             if L > limit:
                 wav = librosa.effects.time_stretch(wav, rate=min(L / limit, 1.25))
     slot = limit
-    maxlen = int(slot * sr)
+    maxlen = int((slot + (1.2 if ACTIVE_TTS == "indicf5" else 0.0)) * sr)   # வார்த்தையை நடுவுல வெட்டாம கொஞ்சம் overflow
     if len(wav) > maxlen:
         wav = wav[:maxlen].copy()
         f = min(int(0.04 * sr), len(wav))
