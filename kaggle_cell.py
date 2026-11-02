@@ -15,6 +15,8 @@ subprocess.run("pip install -q pyannote.audio", shell=True)
 
 # IndicF5 (தமிழ் குரல் clone மாடல்)
 subprocess.run("pip install -q git+https://github.com/ai4bharat/IndicF5.git", shell=True)
+# IndicF5 'meta device' பிழைக்கு: அதுக்கு ஏத்த பழைய transformers
+subprocess.run('pip install -q "transformers==4.49.0" "accelerate==0.33.0"', shell=True)
 
 from kaggle_secrets import UserSecretsClient
 s = UserSecretsClient()
