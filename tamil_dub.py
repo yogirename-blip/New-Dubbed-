@@ -107,6 +107,10 @@ def ensure_deps():
         import demucs  # noqa
     except ImportError:
         sh(f"{sys.executable} -m pip install -q demucs", check=False)
+    try:
+        import edge_tts  # noqa
+    except ImportError:
+        sh(f"{sys.executable} -m pip install -q edge-tts", check=False)
     import numpy  # noqa
 
 
@@ -465,6 +469,38 @@ def speech_segments(mask, merge=0.4, min_len=0.25):
     return [m for m in merged if m[1] - m[0] >= min_len]
 
 
+def align_lines(lines, mask, maxshift=15.0):
+    """Oru chunk-la ellaa varigalum orey alavu munnaadi/pinnaadi irundhaa (Gemini neram thappu),
+    asal pechoda match aagura shift-a kandupidichu motha chunk-aiyum nagarthum."""
+    if len(lines) < 3 or len(mask) == 0:
+        return 0.0
+    K = int(maxshift / FRAME)
+    a0 = max(0, int(min(l["start"] for l in lines) / FRAME))
+    a1 = min(len(mask), int(max(l["end"] for l in lines) / FRAME) + 1)
+    if a1 - a0 < 20:
+        return 0.0
+    act = np.zeros(a1 - a0)
+    for l in lines:
+        s_ = max(0, int(l["start"] / FRAME) - a0)
+        e_ = min(len(act), int(l["end"] / FRAME) - a0 + 1)
+        if e_ > s_:
+            act[s_:e_] = 1.0
+    m = np.where(mask, 1.0, -1.0)
+    lo, hi = a0 - K, a1 + K
+    win = np.full(hi - lo, -1.0)
+    sl, sh_ = max(0, lo), min(len(m), hi)
+    win[sl - lo: sh_ - lo] = m[sl:sh_]
+    sc = np.correlate(win, act, mode="valid")          # 2K+1 shifts
+    j = int(np.argmax(sc))
+    if j == K or sc[j] - sc[K] < 0.08 * act.sum():
+        return 0.0
+    shift = (j - K) * FRAME
+    for l in lines:
+        l["start"] = round(max(0.0, l["start"] + shift), 2)
+        l["end"] = round(max(l["start"] + 0.2, l["end"] + shift), 2)
+    return shift
+
+
 def snap_lines(lines, segs, window=5.0):
     """Gemini sollura neram konjam thappa irukkum. Asal kural nijama kekkura idathukku line-a nagarthum
     (adhaan 'kural oru pakkam, video oru pakkam' prachanai-ku theervu)."""
@@ -541,6 +577,13 @@ def step_script(video):
     print("[2] Gemini-ku video anuppi script eluthurom...")
     proxy = make_proxy(video)
     total = duration(proxy)
+    voc0 = os.path.join(WORK, "vocals.wav")
+    mask0 = None
+    if os.path.exists(voc0):
+        try:
+            mask0 = speech_mask(voc0)
+        except Exception as e:  # noqa
+            print("  speech mask fail:", str(e)[:120])
     step = CHUNK_MIN * 60
     chars, lines = {}, []
     n = int(np.ceil(total / step))
@@ -560,7 +603,12 @@ def step_script(video):
             except Exception as e:  # noqa
                 print(f"  chunk {i+1} fail (try {attempt+1}/3): {str(e)[:150]}")
                 time.sleep(5)
-        lines += got or []
+        got = got or []
+        if mask0 is not None and got:
+            sh_ = align_lines(got, mask0)
+            if sh_:
+                print(f"  chunk {i+1}: neram {sh_:+.1f}s sari pannapattathu")
+        lines += got
         _P(f"📝 Script எழுதுறேன் (பகுதி {i+1}/{n})", 30 + 20 * (i + 1) / n)
 
     lines.sort(key=lambda x: x["start"])
@@ -729,6 +777,54 @@ def tts(text, voice, system):
     return trim_silence(retry(go, what="tts"))
 
 
+_state_tts = {"fails": 0, "dead_until": 0.0}
+EDGE_VOICES = {"male": "ta-IN-ValluvarNeural", "female": "ta-IN-PallaviNeural"}
+
+
+def edge_tts_np(text, gender):
+    """Gemini TTS limit/fail aana edge-tts (ilavasam, limit illa) Tamil kural."""
+    import asyncio as _aio
+    import edge_tts
+    uid = uuid.uuid4().hex[:10]
+    mp3 = os.path.join(WORK, f"_e_{uid}.mp3")
+    wav = os.path.join(WORK, f"_e_{uid}.wav")
+    voice = EDGE_VOICES.get(gender, EDGE_VOICES["male"])
+
+    async def go():
+        await edge_tts.Communicate(text, voice).save(mp3)
+    try:
+        _aio.run(go())
+        sh(f'ffmpeg -y -i "{mp3}" -ac 1 -ar {SR} "{wav}"')
+        return trim_silence(read_wav(wav))
+    finally:
+        for t in (mp3, wav):
+            if os.path.exists(t):
+                os.remove(t)
+
+
+def speak(text, voice, system, gender):
+    """Mudhalla Gemini; fail / limit na udane edge-tts. (ethuvum fail aanaa exception)"""
+    if time.time() >= _state_tts["dead_until"]:
+        try:
+            a = tts(text, voice, system)
+            _state_tts["fails"] = 0
+            return a
+        except Exception as e:  # noqa
+            _state_tts["fails"] += 1
+            print(f"  Gemini TTS fail ({_state_tts['fails']}): {str(e)[:100]}")
+            if _state_tts["fails"] >= 3:           # limit pola: konja neram Gemini-a vittuda
+                _state_tts["dead_until"] = time.time() + 120
+                _state_tts["fails"] = 0
+    last = None
+    for _ in range(3):
+        try:
+            return edge_tts_np(text, gender)
+        except Exception as e:  # noqa
+            last = e
+            time.sleep(2)
+    raise RuntimeError(f"edge-tts fail: {str(last)[:100]}")
+
+
 def shorten(text, ratio):
     prompt = (f"Shorten this colloquial Tamil dubbing line to about {int(ratio*100)}% of its length. "
               f"Keep meaning and tone, keep it spoken Tamil. Return ONLY the Tamil text.\n\n{text}")
@@ -788,8 +884,9 @@ def step_tts(script):
         nxt = lines[i + 1]["start"] if i + 1 < len(lines) else ln["end"] + 1.5
         orig_len = ln["end"] - ln["start"]
         allowed = max(orig_len, min(nxt - ln["start"] - 0.05, orig_len * 1.6 + 0.5))
+        gender = c.get("gender", "male")
         try:
-            audio = tts(text, voices.get(ln["speaker"], "Kore"), system)
+            audio = speak(text, voices.get(ln["speaker"], "Kore"), system, gender)
         except Exception as e:  # noqa
             print(f"  line {i} TTS fail: {str(e)[:120]}")
             return i, np.zeros(int(0.1 * SR), dtype=np.float32)
@@ -797,7 +894,7 @@ def step_tts(script):
         if dur > allowed * 1.25 and len(text) > 12:
             try:
                 short = shorten(text, max(0.5, allowed / dur))
-                audio = tts(short, voices.get(ln["speaker"], "Kore"), system)
+                audio = speak(short, voices.get(ln["speaker"], "Kore"), system, gender)
                 ln["tamil_short"] = short
                 dur = len(audio) / SR
             except Exception as e:  # noqa
@@ -833,6 +930,42 @@ def step_tts(script):
 
 
 # ----------------------------- STEP 5: mix ----------------------------------
+def keep_original_where_undubbed(track, lines, audios):
+    """Dub kural varaadha idathula 'music mattum' kekkaamal, asal kural-a (vocals.wav) serkkum."""
+    voc = os.path.join(WORK, "vocals.wav")
+    if not os.path.exists(voc):
+        return 0
+    try:
+        r = subprocess.run(["ffmpeg", "-v", "error", "-i", voc, "-ac", "1", "-ar", str(SR),
+                            "-f", "s16le", "-"], capture_output=True)
+        x = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+        segs = speech_segments(speech_mask(voc))
+    except Exception as e:  # noqa
+        print("  original voice check fail:", str(e)[:120])
+        return 0
+    spans = []
+    for ln, a in zip(lines, audios):
+        dur = len(a) / SR
+        if dur > 0.3:                      # fail aana (silent) varigal count aagaadhu
+            spans.append((ln["start"], max(ln["end"], ln["start"] + dur) + 0.2))
+    kept = 0
+    for s_, e_ in segs:
+        if any(min(e_, b) - max(s_, a) > 0.15 for a, b in spans):
+            continue
+        i0, i1 = int(max(0, s_ - 0.1) * SR), min(len(x), len(track), int((e_ + 0.1) * SR))
+        if i1 - i0 < int(0.2 * SR):
+            continue
+        seg = x[i0:i1].copy()
+        f = min(len(seg) // 2, int(0.05 * SR))
+        if f > 0:
+            seg[:f] *= np.linspace(0, 1, f)
+            seg[-f:] *= np.linspace(1, 0, f)
+        track[i0:i1] += seg * 0.9
+        kept += 1
+    print(f"  {kept} idathula dub illa -> asal kural serthom")
+    return kept
+
+
 def step_mix(video, bgm, lines, audios):
     check_cancel()
     print("[5] Ellathaiyum serkkirom...")
@@ -843,6 +976,7 @@ def step_mix(video, bgm, lines, audios):
         e = min(len(track), s + len(a))
         if s < len(track):
             track[s:e] += a[: e - s]
+    STATS["orig_kept"] = keep_original_where_undubbed(track, lines, audios)
     peak = np.abs(track).max()
     if peak > 1.0:
         track /= peak
@@ -903,6 +1037,8 @@ def dub(video, job_dir, progress=print, fmt="mp4", cancel=None):
         progress(f"⚠️ {STATS['tts_failed']} வரிகளுக்கு குரல் வரல (Gemini limit). மறுபடி அனுப்பிப் பாருங்க.")
     _P("🎬 எல்லாத்தையும் சேர்க்கிறேன்...", 92)
     step_mix(video, bgm, script["lines"], audios)
+    if STATS.get("orig_kept"):
+        progress(f"⚠️ {STATS['orig_kept']} இடங்களுக்கு dub குரல் கிடைக்கல, அங்க அசல் குரல் இருக்கும்.")
     return OUTPUT_VIDEO
 
 
