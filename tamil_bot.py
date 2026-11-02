@@ -266,8 +266,11 @@ async def worker():
         event = job.event
         ACTIVE["job"] = job
         write_state()
-        folder = os.path.join(BASE, f"{job.user_id}_{int(time.time())}")
+        doc = getattr(event.message, "document", None)          # adhey video-va marubadi anuppinaa ippo vittadhulirundhu thodarum
+        key = getattr(doc, "id", None) or int(time.time())
+        folder = os.path.join(BASE, f"{job.user_id}_{key}")
         os.makedirs(folder, exist_ok=True)
+        keep_folder = False
         stop = asyncio.Event()
         tick = asyncio.create_task(ticker(job, stop))
         try:
@@ -279,8 +282,13 @@ async def worker():
                 if total:
                     job.pct = max(job.pct, 8 * done / total)
 
-            src = await run_task(job, event.download_media(file=os.path.join(folder, "input"),
-                                                          progress_callback=dl_prog))
+            import glob as _glob
+            old = [f for f in _glob.glob(os.path.join(folder, "input.*")) if os.path.getsize(f) > 0]
+            if old:
+                src = old[0]                                     # munnaadi download aanadhu - thirumba download venaam
+            else:
+                src = await run_task(job, event.download_media(file=os.path.join(folder, "input"),
+                                                              progress_callback=dl_prog))
             job.pct = 8
 
             def progress(msg=None, pct=None):
@@ -302,6 +310,9 @@ async def worker():
                     job.pct = max(job.pct, 98 + 2 * done / total)
 
             as_doc = job.send == "document" or job.fmt == "mkv"
+            if os.path.getsize(out) > 1_990_000_000:
+                as_doc = True
+                await say(event, "⚠️ Output 2GB-ku mela irukku, Telegram-la anuppa mudiyaama pogalaam.")
             await run_task(job, client.send_file(event.chat_id, out, caption="தமிழ் dub 🎧",
                                                  force_document=as_doc, supports_streaming=not as_doc,
                                                  reply_to=event.id, progress_callback=up_prog))
@@ -313,10 +324,12 @@ async def worker():
         except Exception as e:  # noqa
             traceback.print_exc()
             stop.set(); await tick
-            await render(job, final=f"❌ பிழை: {str(e)[:300]}")
+            keep_folder = True            # fail aanaa folder-a vechuko -> marubadi anuppinaa script/kural cache-la irundhu thodarum
+            await render(job, final=f"❌ பிழை: {str(e)[:300]}\n\nஅதே வீடியோவை மறுபடி அனுப்புங்க - முடிஞ்ச வேலை திரும்ப செய்ய வேண்டாம்.")
         finally:
             stop.set()
-            shutil.rmtree(folder, ignore_errors=True)
+            if not keep_folder:
+                shutil.rmtree(folder, ignore_errors=True)
             JOBS.pop(job.id, None)
             ACTIVE["job"] = None
             write_state()
@@ -337,6 +350,13 @@ async def heartbeat():
 
 async def main():
     prev = _load(STATE_FILE, None)
+    try:                                           # 24 mani neram munnaadi irundha pazhaya folders-a azhi
+        for d in os.listdir(BASE):
+            dp = os.path.join(BASE, d)
+            if os.path.isdir(dp) and time.time() - os.path.getmtime(dp) > 86400:
+                shutil.rmtree(dp, ignore_errors=True)
+    except Exception:  # noqa
+        pass
     await client.start(bot_token=BOT_TOKEN)
     me = await client.get_me()
     print(f"Bot ready: @{me.username}  (Telegram-la poi /start anuppunga)")
