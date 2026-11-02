@@ -1,6 +1,12 @@
 import asyncio
 import json
 import os
+
+# transformers TensorFlow/JAX-ஐ தொடவே வேணாம் (numpy 1.26 உடன் jax உடையுது)
+for _k, _v in (("USE_TF", "0"), ("USE_JAX", "0"), ("USE_FLAX", "0"),
+               ("TRANSFORMERS_NO_TF", "1"), ("TRANSFORMERS_NO_FLAX", "1"),
+               ("USE_TORCH", "1")):
+    os.environ.setdefault(_k, _v)
 import re
 import shutil
 import subprocess
@@ -31,7 +37,7 @@ BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHARS_PER_SEC = 11.0                                  # பேச்சு வேகம் (எழுத்து/வினாடி)
 # code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
-BOT_VERSION = "2026-11-02-r20 (IndicF5 meta-device fix)"
+BOT_VERSION = "2026-11-02-r21 (IndicF5 no-TF/JAX fix)"
 NATURAL_TAMIL_MODE = os.environ.get("NATURAL_TAMIL_MODE", "cinema_anime_character").strip().lower()
 REVIEW_TIMEOUT = int(os.environ.get("REVIEW_TIMEOUT", "1200"))
 MANUAL_REVIEW = os.environ.get("MANUAL_REVIEW", "0") == "1"   # 1 போட்டா மட்டும் கையால் review
