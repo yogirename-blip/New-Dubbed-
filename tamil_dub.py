@@ -867,8 +867,20 @@ def edge_tts_np(text, ev, emotion="neutral"):
                 os.remove(t)
 
 
-def speak(text, voice, system, ev, emotion="neutral"):
-    """Mudhalla Gemini; fail / limit na udane edge-tts. (ethuvum fail aanaa exception)"""
+def speak(text, voice, system, ev, emotion="neutral", cid=None):
+    """OmniVoice -> Gemini -> edge-tts. (ethuvum fail aanaa exception)"""
+    if cid is not None and OMNI["model"] is not None:
+        try:
+            a = omni_speak(text, cid)
+            if a is not None:
+                OMNI["fails"] = 0
+                return a
+        except Exception as e:  # noqa
+            OMNI["fails"] += 1
+            print(f"  OmniVoice fail ({OMNI['fails']}): {str(e)[:100]}")
+            if OMNI["fails"] >= 5:
+                OMNI["off_until"] = time.time() + 300
+                OMNI["fails"] = 0
     if time.time() >= _state_tts["dead_until"]:
         try:
             a = tts(text, voice, system)
@@ -931,12 +943,108 @@ def read_wav(path):
 STATS = {"tts_failed": 0}
 
 
+# ------------------- OmniVoice (GPU-la local, limit illaadha Tamil TTS) -------------------
+OMNI_ENABLE = os.environ.get("OMNIVOICE", "1") != "0"        # 0 -> OmniVoice off
+OMNI_REF = os.environ.get("OMNI_REF", "orig")                # orig = asal nadigar kural clone, edge = Tamil kural reference
+EDGE_REF_TEXT = "வணக்கம், நான் உங்க கூட கொஞ்சம் பேசணும். இன்னைக்கு என்ன நடந்துச்சுன்னு சொல்லுங்க."
+OMNI = {"model": None, "refs": {}, "tried": False, "fails": 0, "off_until": 0.0}
+_omni_lock = threading.Lock()
+
+
+def omni_load():
+    """OmniVoice model-a (Hugging Face-la irundhu) onnu thadavai ethum. GPU illa / fail na None."""
+    if OMNI["tried"]:
+        return OMNI["model"]
+    OMNI["tried"] = True
+    if not OMNI_ENABLE:
+        return None
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            print("  GPU illa -> OmniVoice skip")
+            return None
+        try:
+            import omnivoice  # noqa
+        except ImportError:
+            print("  omnivoice install aaguthu...")
+            sh(f"{sys.executable} -m pip install -q omnivoice", check=False)
+            import importlib
+            importlib.invalidate_caches()
+        from omnivoice import OmniVoice
+        print("  OmniVoice model etthuthu (modhal thadavai download aagum)...")
+        OMNI["model"] = OmniVoice.from_pretrained("k2-fsa/OmniVoice", device_map="cuda:0",
+                                                  dtype=torch.float16)
+        print("  OmniVoice ready")
+    except Exception as e:  # noqa
+        print("  OmniVoice load fail:", str(e)[:200])
+        OMNI["model"] = None
+    return OMNI["model"]
+
+
+def omni_prepare_refs(chars, lines, edge_voices):
+    """Ovvoru character-kum oru reference kural clip thayaar pannum."""
+    voc = os.path.join(WORK, "vocals.wav")
+    mask = None
+    if OMNI_REF != "edge" and os.path.exists(voc):
+        try:
+            mask = speech_mask(voc)
+        except Exception:  # noqa
+            mask = None
+    for cid in chars:
+        path = os.path.join(WORK, f"ref_{cid}.wav")
+        got = None
+        if mask is not None:
+            best, bscore = None, 0.0
+            for ln in lines:
+                if ln.get("speaker") != cid or not ln.get("original"):
+                    continue
+                d = ln["end"] - ln["start"]
+                if not 3.0 <= d <= 10.0:
+                    continue
+                a, b = int(ln["start"] / FRAME), int(ln["end"] / FRAME)
+                frac = float(mask[a:b].mean()) if b > a else 0.0
+                score = frac * min(d, 8.0)
+                if frac >= 0.6 and score > bscore:
+                    best, bscore = ln, score
+            if best is not None:
+                r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{best['start']:.2f}",
+                                    "-t", f"{best['end'] - best['start']:.2f}", "-i", voc,
+                                    "-ac", "1", "-ar", str(SR), path], capture_output=True)
+                if r.returncode == 0 and os.path.exists(path):
+                    got = (path, best["original"])
+        if got is None and OMNI_REF != "orig_only":
+            try:                                             # asal clip illa -> edge-tts Tamil clip reference
+                ev = edge_voices.get(cid, ("ta-IN-ValluvarNeural", 0))
+                write_wav(path, edge_tts_np(EDGE_REF_TEXT, ev), SR)
+                got = (path, EDGE_REF_TEXT)
+            except Exception as e:  # noqa
+                print(f"  ref {cid} fail: {str(e)[:100]}")
+        if got:
+            OMNI["refs"][cid] = got
+    print(f"  OmniVoice reference: {len(OMNI['refs'])}/{len(chars)} characters")
+
+
+def omni_speak(text, cid):
+    m, ref = OMNI["model"], OMNI["refs"].get(cid)
+    if m is None or ref is None or time.time() < OMNI["off_until"]:
+        return None
+    with _omni_lock:                                         # oru GPU model -> orey nerathula onnu
+        out = m.generate(text=text, ref_audio=ref[0], ref_text=ref[1])
+    a = np.asarray(out[0] if isinstance(out, (list, tuple)) else out, dtype=np.float32).reshape(-1)
+    if len(a) < int(0.2 * SR):
+        raise RuntimeError("OmniVoice too short")
+    return trim_silence(a)
+
+
 def step_tts(script):
     chars, lines = script["characters"], script["lines"]
     voices = assign_voices(chars)
     edge_voices = assign_edge_voices(chars)
     print("[3] Kural thervu:", {k: voices[k] for k in voices})
     print(f"[4] {len(lines)} varigalukku Tamil kural uruvaakkurom...")
+    if omni_load():
+        _P("🧠 OmniVoice குரல்களை தயார் பண்றேன்...", 50)
+        omni_prepare_refs(chars, lines, edge_voices)
 
     def work(i):
         check_cancel()
@@ -953,7 +1061,7 @@ def step_tts(script):
         ev = edge_voices.get(ln["speaker"], ("ta-IN-ValluvarNeural", 0))
         emo = ln.get("emotion", "neutral")
         try:
-            audio = speak(text, voices.get(ln["speaker"], "Kore"), system, ev, emo)
+            audio = speak(text, voices.get(ln["speaker"], "Kore"), system, ev, emo, ln["speaker"])
         except Exception as e:  # noqa
             print(f"  line {i} TTS fail: {str(e)[:120]}")
             return i, np.zeros(int(0.1 * SR), dtype=np.float32)
@@ -961,7 +1069,7 @@ def step_tts(script):
         if dur > allowed * 1.25 and len(text) > 12:
             try:
                 short = colloquial(shorten(text, max(0.5, allowed / dur)))
-                audio = speak(short, voices.get(ln["speaker"], "Kore"), system, ev, emo)
+                audio = speak(short, voices.get(ln["speaker"], "Kore"), system, ev, emo, ln["speaker"])
                 ln["tamil_short"] = short
                 dur = len(audio) / SR
             except Exception as e:  # noqa
