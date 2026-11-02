@@ -226,6 +226,9 @@ dialogue in Tamil-dubbed movies. NEVER literary/formal Tamil (sentamil).
 Examples: "என்ன சொல்கிறாய்?" -> "என்ன சொல்ற?",  "நான் வருகிறேன்" -> "நான் வரேன்",
 "அது இருக்கிறது" -> "அது இருக்கு",  "எனக்கு வேண்டும்" -> "எனக்கு வேணும்",  "ஆனால்" -> "ஆனா",
 "இல்லை" -> "இல்ல",  "நீங்கள்" -> "நீங்க",  "அவர்கள்" -> "அவங்க",  "பிறகு" -> "அப்புறம்".
+Imagine real friends / family chatting casually and write what THAT character would really say in THAT situation
+(a kid talks like a kid, an angry man like an angry man, a boss like a boss). Use everyday English words in Tamil
+script when natural (டைம், பிளான், ப்ராப்ளம், ஓகே, சாரி, ப்ளீஸ்).
 Never use words like மற்றும், ஏனெனில், எனவே. Use natural interjections (டா, சரி, ஆமா, அய்யோ) only where they fit.
 Write in Tamil script. Common loanwords are fine (ஓகே, சாரி, போன்). No Hindi/English sentences.
 Keep meaning, emotion and length close to the original so it fits the same time. Short, speakable sentences.
@@ -253,6 +256,18 @@ POLISH_PROMPT = """You are the top dialogue writer for Tamil-dubbed movies and w
 people watch on TV/OTT). Rewrite the Tamil of every line below so it sounds like REAL spoken Tamil as people
 talk in Chennai, as in a professional movie dub. NOT written / formal / literary Tamil.
 
+THINK LIKE THIS: imagine this exact scene happening between real friends / family / colleagues in Chennai.
+How would THIS character say it, in THIS situation, to THIS person? Casual, relaxed, a bit lazy, like talking
+on the phone with a friend. It should never sound like a speech, a book or a news reader.
+Fully re-write the sentence if needed. Do not just swap a few words.
+Formal -> casual examples:
+  "நாம் இங்கே வந்திருக்கிறோம், அதனால் தான் இங்கே போர் நடக்கிறது" -> "நாம இங்க வந்திருக்கோம், அதனாலதான் இங்க சண்டையே நடக்குது"
+  "நீ என்ன செய்து கொண்டிருக்கிறாய்?" -> "நீ என்ன பண்ணிட்டு இருக்க?"
+  "நான் உன்னிடம் ஒன்று சொல்ல வேண்டும்" -> "உன்கிட்ட ஒண்ணு சொல்லணும்"
+  "தயவுசெய்து என்னை மன்னித்து விடுங்கள்" -> "ப்ளீஸ் என்ன மன்னிச்சிடுங்க"
+  "அவர்கள் எங்கே சென்றிருக்கிறார்கள் என்று தெரியவில்லை" -> "அவங்க எங்க போயிருக்காங்கன்னே தெரியல"
+Use everyday English words in Tamil script the way people really talk (டைம், பிளான், ப்ராப்ளம், ஃப்ரெண்ட், ஹெல்ப், சீக்கிரம்,
+ஓகே, சாரி, ப்ளீஸ்) when it feels natural. Contractions and drops are good: -ிட்டு, -ிருக்கேன், -னு, -ன்னு, -ல்ல.
 Rules:
 - Spoken forms: இருக்கிறது->இருக்கு, செய்கிறேன்->பண்றேன்/செய்றேன், சொல்கிறாய்->சொல்ற, வருகிறேன்->வரேன்,
   போகிறேன்->போறேன், இல்லை->இல்ல, வேண்டும்->வேணும், ஆனால்->ஆனா, அதனால்->அதனால, நீங்கள்->நீங்க,
@@ -540,9 +555,10 @@ def snap_lines(lines, segs, window=5.0):
     return moved
 
 
-def polish(lines, chars):
+def polish(lines, chars, strict=False):
     """Ellaa varigalaiyum 'movie dub' pechu Tamil-a maatri ezhuthum."""
-    print("  Tamil-a movie-dub pechu nadaikku maathurom...")
+    print("  Tamil-a movie-dub pechu nadaikku maathurom..." + (" (strict)" if strict else ""))
+    pos = {id(l): n for n, l in enumerate(lines)}
     B = 30
     done = 0
     for i in range(0, len(lines), B):
@@ -550,10 +566,14 @@ def polish(lines, chars):
         items = []
         for k, ln in enumerate(batch):
             c = chars.get(ln["speaker"], {})
-            items.append({"id": k, "who": f"{c.get('age','adult')} {c.get('gender','male')}",
+            items.append({"id": k, "who": f"{c.get('age','adult')} {c.get('gender','male')} ({c.get('tone','')})",
                           "emotion": ln.get("emotion", "neutral"),
                           "en": ln.get("original", ""), "ta": ln["tamil"]})
         prompt = POLISH_PROMPT.format(items=json.dumps(items, ensure_ascii=False))
+        if strict:
+            prompt = ("IMPORTANT: these lines are STILL too formal / bookish. Throw the old Tamil away and write each "
+                      "line again from scratch, the way a close friend would actually say it in a casual chat.\n\n"
+                      + prompt)
         try:
             resp = gen(prompt, types.GenerateContentConfig(
                 response_mime_type="application/json", temperature=0.5), what="polish")
@@ -561,7 +581,7 @@ def polish(lines, chars):
             for it in data.get("lines", []):
                 k = int(it["id"])
                 t = str(it.get("tamil", "")).strip()
-                if 0 <= k < len(batch) and t and len(t) <= len(batch[k]["tamil"]) * 1.6 + 8:
+                if 0 <= k < len(batch) and t and len(t) <= len(batch[k]["tamil"]) * 1.8 + 10:
                     batch[k]["tamil_formal"] = batch[k]["tamil"]
                     batch[k]["tamil"] = t
                     done += 1
@@ -572,6 +592,27 @@ def polish(lines, chars):
 
 # Ezhuthu-Tamil -> pechu-Tamil. Gemini sila neram formal-aa ezhudhinaalum idhu pidichu maatthum.
 _COLLOQ = [
+    (r"ன்\s+என்று(?![\u0B80-\u0BFF])", "ன்னு"), (r"ம்\s+என்று(?![\u0B80-\u0BFF])", "ம்னு"),
+    (r"\s+என்று(?![\u0B80-\u0BFF])", "ன்னு"), (r"ஒன்று", "ஒண்ணு"),
+    (r"சென்றிரு", "போயிரு"), (r"சென்றுவிட", "போயிட"),
+    (r"அதனால் தான்", "அதனாலதான்"), (r"அதனால்தான்", "அதனாலதான்"), (r"இதனால்", "இதனால"), (r"அதனால்", "அதனால"),
+    (r"தெரிகிறது", "தெரியுது"), (r"புரிகிறது", "புரியுது"), (r"தெரிகிறேன்", "தெரியுறேன்"),
+    (r"வந்திருக்கிறோம்", "வந்திருக்கோம்"), (r"இருக்கிறோம்", "இருக்கோம்"), (r"கின்றது", "குது"), (r"கின்ற", "கிற"),
+    (r"நாங்கள்", "நாங்க"), (r"\bநாம்(?![\u0B80-\u0BFF])", "நாம"), (r"மிகவும்", "ரொம்ப"), (r"தயவுசெய்து", "ப்ளீஸ்"),
+    (r"நிச்சயமாக", "கண்டிப்பா"), (r"ஆமாம்", "ஆமா"), (r"உண்மையில்", "உண்மையா"), (r"அல்லது", "இல்லன்னா"),
+    (r"ஏனென்றால்", "ஏன்னா"), (r"இருப்பினும்", "இருந்தாலும்"), (r"எனினும்", "இருந்தாலும்"), (r"ஆகவே", "அதனால"),
+    (r"என்னிடம்", "என்கிட்ட"), (r"உன்னிடம்", "உன்கிட்ட"), (r"அவனிடம்", "அவன்கிட்ட"), (r"அவரிடம்", "அவர்கிட்ட"),
+    (r"அவளிடம்", "அவகிட்ட"), (r"உங்களிடம்", "உங்ககிட்ட"), (r"நம்மிடம்", "நம்மகிட்ட"), (r"பற்றி", "பத்தி"),
+    (r"அங்கு", "அங்க"), (r"இங்கு", "இங்க"), (r"எங்கு", "எங்க"), (r"இன்று", "இன்னைக்கு"), (r"நேற்று", "நேத்து"),
+    (r"இவ்வளவு", "இவ்ளோ"), (r"அவ்வளவு", "அவ்ளோ"), (r"எவ்வளவு", "எவ்ளோ"), (r"ஒன்றும்", "ஒண்ணும்"),
+    (r"இரண்டு", "ரெண்டு"), (r"மூன்று", "மூணு"), (r"நான்கு", "நாலு"), (r"ஐந்து", "அஞ்சு"),
+    (r"சென்றேன்", "போனேன்"), (r"சென்றோம்", "போனோம்"), (r"சென்றான்", "போனான்"), (r"சென்றாள்", "போனாள்"),
+    (r"சென்றார்கள்", "போனாங்க"), (r"சென்றார்", "போனாரு"), (r"சென்று", "போய்"),
+    (r"கூறினான்", "சொன்னான்"), (r"கூறினாள்", "சொன்னாள்"), (r"கூறினார்", "சொன்னாரு"), (r"கூறு", "சொல்லு"),
+    (r"என்றான்", "சொன்னான்"), (r"என்றாள்", "சொன்னாள்"), (r"என்றார்", "சொன்னாரு"),
+    (r"தேவையில்லை", "தேவையில்ல"), (r"ாமல்(?![\u0B80-\u0BFF])", "ாம"),
+    (r"(?<=\u0BCD)(தால்|றால்|டால்)(?![\u0B80-\u0BFF])", lambda m: m.group(1)[:-2]),
+    (r"ுங்கள்", "ுங்க"), (r"ீர்கள்", "ீங்க"), (r"ார்கள்", "ாங்க"),
     (r"வருகிறேன்", "வரேன்"), (r"வருகிறாய்", "வர்ற"), (r"வருகிறார்கள்", "வராங்க"), (r"வருகிறார்", "வராரு"),
     (r"வருகிறான்", "வரான்"), (r"வருகிறாள்", "வராள்"), (r"வருகிறது", "வருது"), (r"வருவேன்", "வருவேன்"),
     (r"போகிறேன்", "போறேன்"), (r"போகிறாய்", "போற"), (r"போகிறார்கள்", "போறாங்க"), (r"போகிறான்", "போறான்"),
@@ -593,6 +634,7 @@ _COLLOQ = [
     # if-clauses: வந்தால் -> வந்தா
     (r"(வந்த|போன|சொன்ன|பார்த்த|செய்த|பண்ணின|இருந்த|கேட்ட|கொடுத்த|சென்ற|தெரிந்த|முடிந்த|ஆன)ால்(?![\u0B80-\u0BFF])", r"\1ா"),
     (r"(இருக்க|போக|வர|செய்ய|பார்க்க|சொல்ல)ிறது", r"\1ுது"),
+    (r"சென்ற", "போன"),
     (r"க்கிறது", "க்குது"), (r"க்கிற", "க்குற"),
     # generic present tense: ...கிறேன் -> ...றேன், ...கிறாய் -> ...ற, ...கிறார்கள் -> ...றாங்க
     (r"கிறார்கள்", "றாங்க"), (r"கிறேன்", "றேன்"), (r"கிறாய்", "ற"), (r"கிறான்", "றான்"), (r"கிறாள்", "றாள்"),
@@ -605,6 +647,11 @@ def colloquial(text):
     for pat, rp in _COLLOQ:
         text = re.sub(pat, rp, text)
     return text
+
+
+# innum 'pustaga Tamil' maadhiri irukkura varigalai kandupidikka
+FORMAL_RE = re.compile(r"(கிறே|கிறா|கிறோ|கிறீ|கிறது|இங்கே|அங்கே|எங்கே|ங்கள்|ார்கள்|ன்றால்|தால்(?![\u0B80-\u0BFF])|"
+                       r"வேண்டும்|இல்லை|ஆனால்|மிகவும்|செய்|கொள்கிறே|இயலும்|இயலாது|வேண்டியது|அவர்களை|உள்ளது|உள்ளன)")
 
 
 def step_script(video):
@@ -666,6 +713,12 @@ def step_script(video):
     polish(lines, chars)
     for ln in lines:                                       # kadaisiyaa pechu-Tamil-a urudhi seyyum
         ln["tamil"] = colloquial(ln["tamil"])
+    still = [ln for ln in lines if FORMAL_RE.search(ln["tamil"])]
+    if still:                                              # innum formal-aa irukkura varigal -> thirumba strict-aa
+        print(f"  {len(still)} varigal innum formal-aa irukku, thirumba maatthurom...")
+        polish(still, chars, strict=True)
+        for ln in still:
+            ln["tamil"] = colloquial(ln["tamil"])
     out = {"characters": chars, "lines": lines}
     json.dump(out, open(script_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     print(f"  {len(lines)} varigal, {len(chars)} characters")
