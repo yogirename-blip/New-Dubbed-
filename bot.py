@@ -31,10 +31,12 @@ BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHARS_PER_SEC = 11.0                                  # பேச்சு வேகம் (எழுத்து/வினாடி)
 # code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
-BOT_VERSION = "2026-11-01-r18 (keep-alive + speaker report)"
+BOT_VERSION = "2026-11-02-r19 (IndicF5 voice clone + keep-alive)"
 NATURAL_TAMIL_MODE = os.environ.get("NATURAL_TAMIL_MODE", "cinema_anime_character").strip().lower()
 REVIEW_TIMEOUT = int(os.environ.get("REVIEW_TIMEOUT", "1200"))
 MANUAL_REVIEW = os.environ.get("MANUAL_REVIEW", "0") == "1"   # 1 போட்டா மட்டும் கையால் review
+TTS_BACKEND = os.environ.get("TTS_BACKEND", "indicf5").lower()   # indicf5 (தமிழ் specialist) | omnivoice
+ACTIVE_TTS = None                                                # உண்மையில் ஏற்றப்பட்டது
 OMNI_FP32 = os.environ.get("OMNI_FP32", "0") == "1"          # 1 = கரகரப்பு போகலன்னா float32
 DEMUCS_MODEL = os.environ.get("DEMUCS_MODEL", "htdemucs_ft")   # சுத்தமான குரல் பிரிப்பு (htdemucs = வேகம்)
 
@@ -70,10 +72,27 @@ OMNI = None
 
 
 # ---------------------------------------------------------------- models
+class _IndicF5:
+    """ai4bharat/IndicF5 wrapper: zero-shot voice clone (Tamil உட்பட 11 மொழி)."""
+    sampling_rate = 24000
+
+    def __init__(self, model):
+        self.model = model
+
+    def __call__(self, text, ref_path, ref_text):
+        a = self.model(text, ref_audio_path=ref_path, ref_text=ref_text or "")
+        if hasattr(a, "detach"):
+            a = a.detach().cpu().numpy()
+        a = np.asarray(a)
+        if a.dtype == np.int16:
+            a = a.astype(np.float32) / 32768.0
+        a = a.astype(np.float32)
+        return a.reshape(-1) if a.ndim > 1 else a
+
+
 def load_models():
-    global WHISPER, OMNI
+    global WHISPER, OMNI, ACTIVE_TTS
     from faster_whisper import WhisperModel
-    from omnivoice import OmniVoice
 
     try:
         if DEVICE != "cuda":
@@ -83,13 +102,31 @@ def load_models():
         log("Whisper GPU load failed, CPU-க்கு மாறுறேன்:", e)
         WHISPER = WhisperModel("small", device="cpu", compute_type="int8")
 
-    if DEVICE == "cuda":
-        OMNI = OmniVoice.from_pretrained("k2-fsa/OmniVoice", device_map="cuda:0",
-                                         dtype=torch.float32 if OMNI_FP32 else torch.float16)
-    else:
-        OMNI = OmniVoice.from_pretrained("k2-fsa/OmniVoice", device_map="cpu",
-                                         dtype=torch.float32)
-    log("Models loaded on", DEVICE)
+    if TTS_BACKEND == "indicf5":
+        try:
+            from transformers import AutoModel
+            m = AutoModel.from_pretrained("ai4bharat/IndicF5", trust_remote_code=True)
+            if DEVICE == "cuda":
+                try:
+                    m = m.to("cuda")
+                except Exception as e:
+                    log("IndicF5 .to(cuda) skip:", repr(e)[:100])
+            OMNI = _IndicF5(m)
+            ACTIVE_TTS = "indicf5"
+            log("IndicF5 loaded")
+        except Exception as e:
+            log("IndicF5 load FAILED -> OmniVoice-க்கு மாறுறேன:", repr(e)[:300])
+
+    if ACTIVE_TTS is None:
+        from omnivoice import OmniVoice
+        if DEVICE == "cuda":
+            OMNI = OmniVoice.from_pretrained("k2-fsa/OmniVoice", device_map="cuda:0",
+                                             dtype=torch.float32 if OMNI_FP32 else torch.float16)
+        else:
+            OMNI = OmniVoice.from_pretrained("k2-fsa/OmniVoice", device_map="cpu",
+                                             dtype=torch.float32)
+        ACTIVE_TTS = "omnivoice"
+    log("Models loaded on", DEVICE, "| TTS:", ACTIVE_TTS)
 
 
 # ---------------------------------------------------------------- helpers
@@ -1120,6 +1157,11 @@ def synth(text, ref_path, ref_text, duration=None, lang="ta"):
         torch.manual_seed(_SEED)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(_SEED)
+    if ACTIVE_TTS == "indicf5":
+        # IndicF5-க்கு duration/language parameter இல்ல; நேரம் பொருத்துறத fit_to_slot பாத்துக்கும்
+        if not ref_path:
+            raise RuntimeError("IndicF5-க்கு reference குரல் வேணும்")
+        return OMNI(text, ref_path, ref_text)
     kw = dict(text=text, language=lang, num_step=NUM_STEP, pad_duration=0.0)
     if ref_path:
         kw["ref_audio"] = ref_path
@@ -1149,6 +1191,8 @@ def fit_to_slot(wav, sr, slot, text, ref_path, ref_text, lang="ta", target_rms=N
         rate = L / limit
         if rate <= 1.15:
             wav = librosa.effects.time_stretch(wav, rate=rate)
+        elif ACTIVE_TTS == "indicf5":              # IndicF5-ல duration இல்ல -> மெதுவா மட்டும் வேகப்படுத்து
+            wav = librosa.effects.time_stretch(wav, rate=min(rate, 1.25))
         else:
             try:
                 w2 = synth(text, ref_path, ref_text, duration=limit * 0.97, lang=lang)
