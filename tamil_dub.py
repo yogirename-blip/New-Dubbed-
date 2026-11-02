@@ -82,20 +82,26 @@ os.makedirs(os.path.join(WORK, "tts"), exist_ok=True)
 
 # ----------------------------- helpers --------------------------------------
 def retry(fn, tries=6, base=4.0, what="call"):
+    last = ""
     for i in range(tries):
         try:
             return fn()
         except Exception as e:  # noqa
             msg = str(e)
+            last = msg
             wait = base * (2 ** i)
+            print(f"  [{what}] error: {msg[:220].replace(chr(10), ' ')}")
+            if "limit: 0" in msg:      # indha model-ku quota-ve illa, wait panni payan illa
+                raise RuntimeError(f"{what}: quota 0 -> {msg[:250]}")
             if "429" in msg or "RESOURCE_EXHAUSTED" in msg or "503" in msg or "UNAVAILABLE" in msg:
-                print(f"  [{what}] limit/busy, {wait:.0f}s kaathirukkirom...")
-                time.sleep(wait)
+                if i < tries - 1:
+                    print(f"  [{what}] {wait:.0f}s kaathirukkirom...")
+                    time.sleep(wait)
                 continue
             if i == tries - 1:
                 raise
             time.sleep(2)
-    raise RuntimeError(f"{what} failed")
+    raise RuntimeError(f"{what} failed: {last[:300]}")
 
 
 def ts_to_sec(t):
@@ -178,6 +184,29 @@ Return ONLY JSON:
 Only list characters that appear in this clip in "characters"."""
 
 
+TEXT_MODELS = []
+for _m in [os.environ.get("GEMINI_TEXT_MODEL"), TEXT_MODEL,
+           "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"]:
+    if _m and _m not in TEXT_MODELS:
+        TEXT_MODELS.append(_m)
+
+
+def gen(contents, config=None, what="gemini"):
+    """Text/video model-ku call. Oru model fail aana adutha model-ku maarum."""
+    last = None
+    for m in TEXT_MODELS:
+        try:
+            r = retry(lambda: client.models.generate_content(
+                model=m, contents=contents, config=config), tries=4, what=f"{what}:{m}")
+            if m != TEXT_MODELS[0]:
+                print(f"  ({m} use aachu)")
+            return r
+        except Exception as e:  # noqa
+            last = e
+            print(f"  {m} work aagala, adutha model try pannuren...")
+    raise RuntimeError(f"ellaa models-um fail. Kadaisi error: {str(last)[:300]}")
+
+
 def make_proxy(video):
     proxy = os.path.join(WORK, "proxy.mp4")
     if not os.path.exists(proxy):
@@ -221,14 +250,9 @@ def step_script(video):
                       json.dumps(chars, ensure_ascii=False))
         prompt = SCRIPT_PROMPT.format(roster=roster)
 
-        def call():
-            return client.models.generate_content(
-                model=TEXT_MODEL,
-                contents=[f, prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json", temperature=0.4),
-            )
-        resp = retry(call, what="script")
+        resp = gen([f, prompt],
+                   types.GenerateContentConfig(response_mime_type="application/json",
+                                               temperature=0.4), what="script")
         try:
             data = json.loads(resp.text)
         except Exception:
@@ -367,8 +391,7 @@ def tts(text, voice, system):
 def shorten(text, ratio):
     prompt = (f"Shorten this colloquial Tamil dubbing line to about {int(ratio*100)}% of its length. "
               f"Keep meaning and tone, keep it spoken Tamil. Return ONLY the Tamil text.\n\n{text}")
-    r = retry(lambda: client.models.generate_content(model=TEXT_MODEL, contents=prompt),
-              what="shorten")
+    r = gen(prompt, what="shorten")
     return r.text.strip().strip('"')
 
 
