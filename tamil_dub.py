@@ -257,6 +257,8 @@ Rules:
 - Spoken forms: இருக்கிறது->இருக்கு, செய்கிறேன்->பண்றேன்/செய்றேன், சொல்கிறாய்->சொல்ற, வருகிறேன்->வரேன்,
   போகிறேன்->போறேன், இல்லை->இல்ல, வேண்டும்->வேணும், ஆனால்->ஆனா, அதனால்->அதனால, நீங்கள்->நீங்க,
   அவர்கள்->அவங்க, என்னுடைய->என்னோட, எப்படி இருக்கிறாய்->எப்படி இருக்க, பிறகு->அப்புறம்.
+- Example: "இப்போ நான் இங்கே வந்தால் என்ன செய்வேன்" -> "இப்போ நான் இங்க வந்தா என்ன பண்ணுவேன்".
+  Always: -ால் (if) -> -ா, இங்கே/அங்கே/எங்கே -> இங்க/அங்க/எங்க, செய் -> பண்ணு, -கிறேன் -> -றேன்.
 - Never use: மற்றும், ஏனெனில், எனவே, ஆகையால், அவ்வாறு.
 - Match the speaker: young/angry male can say டா, வாடா, போடா; polite or elder-facing speech uses நீங்க, சார்,
   -ங்க; kids and women talk naturally for their age. Use fillers (சரி, ஆமா, அய்யோ, ஹே) only when they fit the emotion.
@@ -568,6 +570,43 @@ def polish(lines, chars):
     print(f"  {done}/{len(lines)} varigal maathapattana")
 
 
+# Ezhuthu-Tamil -> pechu-Tamil. Gemini sila neram formal-aa ezhudhinaalum idhu pidichu maatthum.
+_COLLOQ = [
+    (r"வருகிறேன்", "வரேன்"), (r"வருகிறாய்", "வர்ற"), (r"வருகிறார்கள்", "வராங்க"), (r"வருகிறார்", "வராரு"),
+    (r"வருகிறான்", "வரான்"), (r"வருகிறாள்", "வராள்"), (r"வருகிறது", "வருது"), (r"வருவேன்", "வருவேன்"),
+    (r"போகிறேன்", "போறேன்"), (r"போகிறாய்", "போற"), (r"போகிறார்கள்", "போறாங்க"), (r"போகிறான்", "போறான்"),
+    (r"போகிறது", "போகுது"), (r"செய்வேன்", "பண்ணுவேன்"), (r"செய்வாய்", "பண்ணுவ"), (r"செய்வோம்", "பண்ணுவோம்"),
+    (r"செய்கிறேன்", "பண்றேன்"), (r"செய்கிறாய்", "பண்ற"), (r"செய்கிறார்கள்", "பண்றாங்க"), (r"செய்கிறான்", "பண்றான்"),
+    (r"செய்யுங்கள்", "பண்ணுங்க"), (r"செய்யலாம்", "பண்ணலாம்"), (r"செய்யவில்லை", "பண்ணல"), (r"செய்ய", "பண்ண"),
+    (r"செய்தேன்", "பண்ணேன்"), (r"செய்தாய்", "பண்ண"), (r"செய்தார்", "பண்ணாரு"), (r"செய்து", "பண்ணி"),
+    (r"இருக்கிறது", "இருக்கு"), (r"இருக்கிறேன்", "இருக்கேன்"), (r"இருக்கிறாய்", "இருக்க"), (r"இருக்கிறார்கள்", "இருக்காங்க"),
+    (r"இருக்கிறார்", "இருக்காரு"), (r"இருக்கிறான்", "இருக்கான்"), (r"இருக்கின்றன", "இருக்கு"),
+    (r"சொல்கிறேன்", "சொல்றேன்"), (r"சொல்கிறாய்", "சொல்ற"), (r"சொல்கிறார்கள்", "சொல்றாங்க"), (r"சொல்கிறான்", "சொல்றான்"),
+    (r"பார்க்கிறேன்", "பாக்குறேன்"), (r"பார்க்கிறாய்", "பாக்குற"), (r"பார்க்கிறார்கள்", "பாக்குறாங்க"),
+    (r"தெரியவில்லை", "தெரியல"), (r"புரியவில்லை", "புரியல"), (r"முடியவில்லை", "முடியல"), (r"வேண்டாம்", "வேணாம்"),
+    (r"வேண்டும்", "வேணும்"), (r"இல்லை", "இல்ல"), (r"ஆனால்", "ஆனா"), (r"ஆகையால்", "அதனால"), (r"எனவே", "அதனால"),
+    (r"ஏனெனில்", "ஏன்னா"), (r"மற்றும்", "அப்புறம்"), (r"பிறகு", "அப்புறம்"), (r"இப்போது", "இப்போ"), (r"அப்போது", "அப்போ"),
+    (r"எப்போது", "எப்போ"), (r"இங்கே", "இங்க"), (r"அங்கே", "அங்க"), (r"எங்கே", "எங்க"), (r"இன்னும்", "இன்னும்"),
+    (r"நீங்கள்", "நீங்க"), (r"உங்கள்", "உங்க"), (r"எங்கள்", "எங்க"), (r"அவர்கள்", "அவங்க"), (r"இவர்கள்", "இவங்க"),
+    (r"என்னுடைய", "என்னோட"), (r"உன்னுடைய", "உன்னோட"), (r"அவனுடைய", "அவனோட"), (r"அவளுடைய", "அவளோட"),
+    (r"எப்படி இருக்கிறீர்கள்", "எப்படி இருக்கீங்க"),
+    # if-clauses: வந்தால் -> வந்தா
+    (r"(வந்த|போன|சொன்ன|பார்த்த|செய்த|பண்ணின|இருந்த|கேட்ட|கொடுத்த|சென்ற|தெரிந்த|முடிந்த|ஆன)ால்(?![\u0B80-\u0BFF])", r"\1ா"),
+    (r"(இருக்க|போக|வர|செய்ய|பார்க்க|சொல்ல)ிறது", r"\1ுது"),
+    (r"க்கிறது", "க்குது"), (r"க்கிற", "க்குற"),
+    # generic present tense: ...கிறேன் -> ...றேன், ...கிறாய் -> ...ற, ...கிறார்கள் -> ...றாங்க
+    (r"கிறார்கள்", "றாங்க"), (r"கிறேன்", "றேன்"), (r"கிறாய்", "ற"), (r"கிறான்", "றான்"), (r"கிறாள்", "றாள்"),
+    (r"கிறார்", "றாரு"), (r"கிறோம்", "றோம்"), (r"கிறீர்கள்", "றீங்க"), (r"கிறது", "குது"),
+    (r"வில்லை(?![\u0B80-\u0BFF])", "ல"),
+]
+
+
+def colloquial(text):
+    for pat, rp in _COLLOQ:
+        text = re.sub(pat, rp, text)
+    return text
+
+
 def step_script(video):
     script_path = os.path.join(WORK, "script.json")
     if os.path.exists(script_path):
@@ -625,6 +664,8 @@ def step_script(video):
         chars.setdefault(sp, {"id": sp, "gender": "male", "age": "adult",
                               "pitch": "mid", "tone": "neutral"})
     polish(lines, chars)
+    for ln in lines:                                       # kadaisiyaa pechu-Tamil-a urudhi seyyum
+        ln["tamil"] = colloquial(ln["tamil"])
     out = {"characters": chars, "lines": lines}
     json.dump(out, open(script_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     print(f"  {len(lines)} varigal, {len(chars)} characters")
@@ -778,20 +819,44 @@ def tts(text, voice, system):
 
 
 _state_tts = {"fails": 0, "dead_until": 0.0}
-EDGE_VOICES = {"male": "ta-IN-ValluvarNeural", "female": "ta-IN-PallaviNeural"}
+EDGE_POOL = {
+    "male": ["ta-IN-ValluvarNeural", "ta-LK-KumarNeural", "ta-MY-SuryaNeural", "ta-SG-AnbuNeural"],
+    "female": ["ta-IN-PallaviNeural", "ta-LK-SaranyaNeural", "ta-MY-KaniNeural", "ta-SG-VenbaNeural"],
+}
 
 
-def edge_tts_np(text, gender):
+def assign_edge_voices(chars):
+    """Ovvoru character-kum vera voice + vera pitch (ellarukkum ore kural varaadhu)."""
+    cnt = {"male": 0, "female": 0}
+    out = {}
+    for cid, c in chars.items():
+        g = c.get("gender", "male")
+        g = g if g in cnt else "male"
+        k = cnt[g]
+        cnt[g] += 1
+        voice = EDGE_POOL[g][k % 4]
+        hz = {"child": 45, "young": 8, "adult": 0, "elder": -12}.get(c.get("age", "adult"), 0)
+        hz += {"high": 14, "mid": 0, "low": -14}.get(c.get("pitch", "mid"), 0)
+        hz += (k // 4) * (-10 if k % 8 < 4 else 10)        # 4-kku mela irundhaa pitch maathi
+        out[cid] = (voice, int(max(-50, min(50, hz))))
+    return out
+
+
+EMO_RATE = {"angry": 8, "shout": 10, "happy": 6, "scared": 8, "sad": -10, "whisper": -8, "calm": -4}
+
+
+def edge_tts_np(text, ev, emotion="neutral"):
     """Gemini TTS limit/fail aana edge-tts (ilavasam, limit illa) Tamil kural."""
     import asyncio as _aio
     import edge_tts
     uid = uuid.uuid4().hex[:10]
     mp3 = os.path.join(WORK, f"_e_{uid}.mp3")
     wav = os.path.join(WORK, f"_e_{uid}.wav")
-    voice = EDGE_VOICES.get(gender, EDGE_VOICES["male"])
+    voice, hz = ev
+    rate = EMO_RATE.get(emotion, 0)
 
     async def go():
-        await edge_tts.Communicate(text, voice).save(mp3)
+        await edge_tts.Communicate(text, voice, rate=f"{rate:+d}%", pitch=f"{hz:+d}Hz").save(mp3)
     try:
         _aio.run(go())
         sh(f'ffmpeg -y -i "{mp3}" -ac 1 -ar {SR} "{wav}"')
@@ -802,7 +867,7 @@ def edge_tts_np(text, gender):
                 os.remove(t)
 
 
-def speak(text, voice, system, gender):
+def speak(text, voice, system, ev, emotion="neutral"):
     """Mudhalla Gemini; fail / limit na udane edge-tts. (ethuvum fail aanaa exception)"""
     if time.time() >= _state_tts["dead_until"]:
         try:
@@ -818,7 +883,7 @@ def speak(text, voice, system, gender):
     last = None
     for _ in range(3):
         try:
-            return edge_tts_np(text, gender)
+            return edge_tts_np(text, ev, emotion)
         except Exception as e:  # noqa
             last = e
             time.sleep(2)
@@ -869,6 +934,7 @@ STATS = {"tts_failed": 0}
 def step_tts(script):
     chars, lines = script["characters"], script["lines"]
     voices = assign_voices(chars)
+    edge_voices = assign_edge_voices(chars)
     print("[3] Kural thervu:", {k: voices[k] for k in voices})
     print(f"[4] {len(lines)} varigalukku Tamil kural uruvaakkurom...")
 
@@ -884,17 +950,18 @@ def step_tts(script):
         nxt = lines[i + 1]["start"] if i + 1 < len(lines) else ln["end"] + 1.5
         orig_len = ln["end"] - ln["start"]
         allowed = max(orig_len, min(nxt - ln["start"] - 0.05, orig_len * 1.6 + 0.5))
-        gender = c.get("gender", "male")
+        ev = edge_voices.get(ln["speaker"], ("ta-IN-ValluvarNeural", 0))
+        emo = ln.get("emotion", "neutral")
         try:
-            audio = speak(text, voices.get(ln["speaker"], "Kore"), system, gender)
+            audio = speak(text, voices.get(ln["speaker"], "Kore"), system, ev, emo)
         except Exception as e:  # noqa
             print(f"  line {i} TTS fail: {str(e)[:120]}")
             return i, np.zeros(int(0.1 * SR), dtype=np.float32)
         dur = len(audio) / SR
         if dur > allowed * 1.25 and len(text) > 12:
             try:
-                short = shorten(text, max(0.5, allowed / dur))
-                audio = speak(short, voices.get(ln["speaker"], "Kore"), system, gender)
+                short = colloquial(shorten(text, max(0.5, allowed / dur)))
+                audio = speak(short, voices.get(ln["speaker"], "Kore"), system, ev, emo)
                 ln["tamil_short"] = short
                 dur = len(audio) / SR
             except Exception as e:  # noqa
