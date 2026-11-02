@@ -16,7 +16,7 @@ Tamil text-la tappu irundha work/script.json-la edit pannitu marubadi run
 pannunga (dubbed TTS cache-a work/tts folder-a delete pannunga).
 """
 
-import os, sys, re, json, time, glob, shutil, subprocess, wave, uuid
+import os, sys, re, json, time, glob, shutil, subprocess, wave, uuid, threading
 from concurrent.futures import ThreadPoolExecutor
 
 # ----------------------------- CONFIG ---------------------------------------
@@ -37,6 +37,58 @@ BGM_VOLUME   = 0.9
 VOICE_VOLUME = 1.0
 SR           = 24000     # Gemini TTS output sample rate
 # ----------------------------------------------------------------------------
+
+
+class Cancelled(Exception):
+    """User Cancel button-a azhuthinaa idhu varum."""
+
+
+CANCEL = threading.Event()
+_P = lambda msg=None, pct=None: None      # dub() ithai set pannum (progress callback)
+
+
+def check_cancel():
+    if CANCEL.is_set():
+        raise Cancelled("cancelled")
+
+
+def run_cancellable(cmd, on_pct=None):
+    """shell command-a odum pothu Cancel check pannum. demucs '%' progress-um padikkum."""
+    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         start_new_session=True)
+    err = bytearray()
+
+    def reader():
+        buf = b""
+        while True:
+            ch = p.stderr.read(1)
+            if not ch:
+                break
+            err.extend(ch)
+            if ch in (b"\r", b"\n"):
+                m = re.findall(rb"(\d+)%", buf)
+                if m and on_pct:
+                    try:
+                        on_pct(min(100, int(m[-1])))
+                    except Exception:  # noqa
+                        pass
+                buf = b""
+            else:
+                buf += ch
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    while p.poll() is None:
+        if CANCEL.is_set():
+            try:
+                os.killpg(os.getpgid(p.pid), 9)
+            except Exception:  # noqa
+                p.kill()
+            t.join(2)
+            raise Cancelled("cancelled")
+        time.sleep(0.5)
+    t.join(5)
+    return subprocess.CompletedProcess(cmd, p.returncode, "", bytes(err).decode("utf-8", "ignore"))
 
 
 def sh(cmd, check=True):
@@ -140,8 +192,11 @@ def step_bgm(video):
     print("[1] Audio eduthu BGM pirikkirom (CPU-la konjam neram aagum)...")
     full = os.path.join(WORK, "full_audio.wav")
     sh(f'ffmpeg -y -i "{video}" -vn -ac 2 -ar 44100 "{full}"')
-    r = sh(f'{sys.executable} -m demucs --two-stems=vocals -n htdemucs '
-           f'-o "{WORK}/demucs" "{full}"', check=False)
+    check_cancel()
+    _P("🎼 BGM பிரிக்கிறேன்...", 10)
+    r = run_cancellable(f'{sys.executable} -m demucs --two-stems=vocals -n htdemucs '
+                        f'-o "{WORK}/demucs" "{full}"',
+                        on_pct=lambda x: _P("🎼 BGM பிரிக்கிறேன்...", 10 + x * 0.2))
     hits = glob.glob(os.path.join(WORK, "demucs", "**", "no_vocals.wav"), recursive=True)
     if r.returncode == 0 and hits:
         shutil.copy(hits[0], bgm_path)
@@ -424,10 +479,13 @@ def step_script(video):
     n = int(np.ceil(total / step))
     for i in range(n):
         off = i * step
+        check_cancel()
+        _P(f"📝 Script எழுதுறேன் (பகுதி {i+1}/{n})", 30 + 20 * i / n)
         clip = os.path.join(WORK, f"chunk_{i}.mp4")
         cut_clip(proxy, off, step, clip)
         print(f"  chunk {i+1}/{n} ({off/60:.0f} min-la irundhu)")
         lines += run_clip(clip, off, chars)
+        _P(f"📝 Script எழுதுறேன் (பகுதி {i+1}/{n})", 30 + 20 * (i + 1) / n)
 
     lines.sort(key=lambda x: x["start"])
     lines = fill_gaps(proxy, lines, chars, total)
@@ -635,6 +693,7 @@ def step_tts(script):
     print(f"[4] {len(lines)} varigalukku Tamil kural uruvaakkurom...")
 
     def work(i):
+        check_cancel()
         ln = lines[i]
         path = os.path.join(WORK, "tts", f"{i:05d}.wav")
         if os.path.exists(path):
@@ -669,6 +728,7 @@ def step_tts(script):
     with ThreadPoolExecutor(max_workers=TTS_WORKERS) as ex:
         for k, (i, a_) in enumerate(ex.map(work, range(len(lines)))):
             results[i] = a_
+            _P(f"🎙️ தமிழ் குரல் உருவாக்குறேன் ({k+1}/{len(lines)} வரிகள்)", 50 + 40 * (k + 1) / max(1, len(lines)))
             if k % 10 == 0:
                 print(f"  {k+1}/{len(lines)}")
     # fail aana varigalai thaniya marubadi (cache-la illaadhavai)
@@ -680,6 +740,7 @@ def step_tts(script):
         print(f"  {len(failed)} varigal fail aachu, marubadi try (round {rnd+1})...")
         time.sleep(10)
         for i in failed:
+            check_cancel()
             _, results[i] = work(i)
     failed = [i for i in range(len(lines))
               if not os.path.exists(os.path.join(WORK, "tts", f"{i:05d}.wav"))]
@@ -689,6 +750,7 @@ def step_tts(script):
 
 # ----------------------------- STEP 5: mix ----------------------------------
 def step_mix(video, bgm, lines, audios):
+    check_cancel()
     print("[5] Ellathaiyum serkkirom...")
     total = duration(video)
     track = np.zeros(int((total + 5) * SR), dtype=np.float32)
@@ -728,24 +790,34 @@ def step_mix(video, bgm, lines, audios):
 
 
 # ----------------------------- MAIN -----------------------------------------
-def dub(video, job_dir, progress=print, fmt="mp4"):
+def dub(video, job_dir, progress=print, fmt="mp4", cancel=None):
     """Oru video-va Tamil-la dub panni output path-a tharum. (Bot idhai kooppidum)"""
-    global WORK, OUTPUT_VIDEO
+    global WORK, OUTPUT_VIDEO, CANCEL, _P
+    CANCEL = cancel if cancel is not None else threading.Event()
+
+    def _P(msg=None, pct=None):  # noqa: F811  (progress + percentage)
+        try:
+            progress(msg, pct)
+        except TypeError:          # pazhaya progress(msg) mattum edukkum function
+            progress(msg)
+        except Exception:  # noqa
+            pass
     WORK = os.path.join(job_dir, "work")
     fmt = "mkv" if str(fmt).lower() == "mkv" else "mp4"
     OUTPUT_VIDEO = os.path.join(job_dir, f"dubbed_tamil.{fmt}")
     os.makedirs(os.path.join(WORK, "tts"), exist_ok=True)
-    progress(f"Video: {duration(video)/60:.1f} nimisham. BGM pirikkirom...")
+    _P(f"Video: {duration(video)/60:.1f} நிமிடம். BGM பிரிக்கிறேன்...", 10)
     bgm = step_bgm(video)
-    progress("Gemini script eluthuthu (yaar enna pesuranga + pechu Tamil)...")
+    check_cancel()
+    _P("📝 Script எழுதுறேன் (யார் என்ன பேசுறாங்க + பேச்சுத் தமிழ்)...", 30)
     script = step_script(video)
     ls = script["lines"]
     span = f" ({ls[0]['start']:.0f}s - {ls[-1]['end']:.0f}s)" if ls else ""
-    progress(f"{len(ls)} varigal{span}, {len(script['characters'])} characters. Tamil kural uruvaakkuthu...")
+    _P(f"{len(ls)} வரிகள்{span}, {len(script['characters'])} characters. தமிழ் குரல் உருவாக்குறேன்...", 50)
     audios = step_tts(script)
     if STATS["tts_failed"]:
-        progress(f"⚠️ {STATS['tts_failed']} varigalukku kural varala (Gemini limit). Marubadi anuppi paaru.")
-    progress("Ellathaiyum serkkirom...")
+        progress(f"⚠️ {STATS['tts_failed']} வரிகளுக்கு குரல் வரல (Gemini limit). மறுபடி அனுப்பிப் பாருங்க.")
+    _P("🎬 எல்லாத்தையும் சேர்க்கிறேன்...", 92)
     step_mix(video, bgm, script["lines"], audios)
     return OUTPUT_VIDEO
 
