@@ -31,7 +31,7 @@ BG_GAIN = float(os.environ.get("BG_GAIN", "0.8"))     # BGM சத்தம்
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHARS_PER_SEC = 11.0                                  # பேச்சு வேகம் (எழுத்து/வினாடி)
 # code: (தமிழ் பெயர், English name, ISO-639-2, script, chars/sec)
-BOT_VERSION = "2026-11-02-r19 (IndicF5 voice clone + keep-alive)"
+BOT_VERSION = "2026-11-02-r20 (IndicF5 meta-device fix)"
 NATURAL_TAMIL_MODE = os.environ.get("NATURAL_TAMIL_MODE", "cinema_anime_character").strip().lower()
 REVIEW_TIMEOUT = int(os.environ.get("REVIEW_TIMEOUT", "1200"))
 MANUAL_REVIEW = os.environ.get("MANUAL_REVIEW", "0") == "1"   # 1 போட்டா மட்டும் கையால் review
@@ -104,8 +104,19 @@ def load_models():
 
     if TTS_BACKEND == "indicf5":
         try:
+            import transformers
             from transformers import AutoModel
-            m = AutoModel.from_pretrained("ai4bharat/IndicF5", trust_remote_code=True)
+            log("transformers version:", transformers.__version__)
+            m = None
+            # 'meta device' பிழை வராம இருக்க முதல்ல low_cpu_mem_usage=False
+            for kw in ({"low_cpu_mem_usage": False}, {}):
+                try:
+                    m = AutoModel.from_pretrained("ai4bharat/IndicF5", trust_remote_code=True, **kw)
+                    break
+                except Exception as e:
+                    log("IndicF5 load try failed", kw, repr(e)[:200])
+            if m is None:
+                raise RuntimeError("IndicF5 ஏத்த முடியல (transformers version சரியில்லையா?)")
             if DEVICE == "cuda":
                 try:
                     m = m.to("cuda")
