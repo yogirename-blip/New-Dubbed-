@@ -265,6 +265,12 @@ Typical features: -ல / -ல்ல question tags, ன்னு / -னா ending
 Keep ONE consistent casual register in every sentence. Never mix formal and casual words in the same sentence
 (e.g. do not say "நாங்கள் இங்கு வந்தோம், அவர்தான் வந்தாங்க" -> say "நாங்க இங்க வந்தோம், அவருதான் வந்தாரு").
 
+DUBBING STYLE: write it like a good modern Tamil dub of an anime / Hollywood / Korean series (the kind kids and teens watch
+on Pogo, Netflix or Amazon): lively Chennai street-casual Tamil, short punchy lines, same energy as the original.
+Friends say டா/டி, வாடா, போடா, மச்சி; juniors say அண்ணா/அக்கா/சார்; fights and shouts stay short and loud
+("டேய்! என்ன பண்ற நீ?", "நான் உன்ன காப்பாத்துவேன், கண்டிப்பா!", "அது முடியாது, நிறுத்து!").
+Never sound like a textbook, a news reader or a speech. If a line has both a formal word and a casual word, rewrite the whole line casual.
+
 THINK LIKE THIS: imagine this exact scene happening between real friends / family / colleagues in Chennai.
 How would THIS character say it, in THIS situation, to THIS person? Casual, relaxed, a bit lazy, like talking
 on the phone with a friend. It should never sound like a speech, a book or a news reader.
@@ -289,7 +295,7 @@ Rules:
 - Keep the meaning and emotion of the original, keep length about the same (it must fit the same time).
 - Write only Tamil script (loanwords like ஓகே, சாரி, போன் are fine). No explanations.
 
-Input is JSON: each item has id, who, emotion, en (original words), ta (current Tamil).
+Input is JSON: each item has id, who, emotion, en (original words), ta (current Tamil), prev/next (neighbouring lines, only for\ncontext of the scene - do not rewrite them).
 Return ONLY JSON: {{"lines":[{{"id":0,"tamil":"..."}}]}} with EVERY id exactly once.
 
 INPUT:
@@ -575,9 +581,12 @@ def polish(lines, chars, strict=False):
         items = []
         for k, ln in enumerate(batch):
             c = chars.get(ln["speaker"], {})
+            n_ = pos.get(id(ln), 0)
+            prev_ = lines[n_ - 1]["tamil"] if n_ > 0 else ""
+            next_ = lines[n_ + 1]["tamil"] if n_ + 1 < len(lines) else ""
             items.append({"id": k, "who": f"{c.get('age','adult')} {c.get('gender','male')} ({c.get('tone','')})",
                           "emotion": ln.get("emotion", "neutral"),
-                          "en": ln.get("original", ""), "ta": ln["tamil"]})
+                          "en": ln.get("original", ""), "ta": ln["tamil"], "prev": prev_, "next": next_})
         prompt = POLISH_PROMPT.format(items=json.dumps(items, ensure_ascii=False))
         if strict:
             prompt = ("IMPORTANT: these lines are STILL too formal / bookish. Throw the old Tamil away and write each "
@@ -601,6 +610,12 @@ def polish(lines, chars, strict=False):
 
 # Ezhuthu-Tamil -> pechu-Tamil. Gemini sila neram formal-aa ezhudhinaalum idhu pidichu maatthum.
 _COLLOQ = [
+    (r"அனைவரும்", "எல்லாரும்"), (r"அனைத்தும்", "எல்லாமே"), (r"அனைத்து", "எல்லா"), (r"யாவரும்", "எல்லாரும்"),
+    (r"அவ்வாறு", "அப்படி"), (r"இவ்வாறு", "இப்படி"), (r"எவ்வாறு", "எப்படி"), (r"தாங்கள்", "நீங்க"),
+    (r"உள்ளனர்", "இருக்காங்க"), (r"உள்ளார்", "இருக்காரு"), (r"உள்ளது", "இருக்கு"), (r"உள்ளன", "இருக்கு"),
+    (r"குழந்தைகள்", "குழந்தைங்க"), (r"மனிதர்கள்", "மனுஷங்க"), (r"பள்ளிக்கு", "ஸ்கூலுக்கு"), (r"பள்ளியில்", "ஸ்கூல்ல"), (r"பள்ளி", "ஸ்கூல்"), (r"ஆசிரியர்", "டீச்சர்"),
+    (r"மட்டுமே", "மட்டும்தான்"), (r"தயாராக", "ரெடியா"), (r"தயார்", "ரெடி"), (r"மன்னிக்கவும்", "சாரி"),
+    (r"வாருங்கள்", "வாங்க"), (r"போங்கள்", "போங்க"),
     (r"பேசுவது", "பேசுறது"), (r"செய்வது", "பண்றது"), (r"வருவது", "வர்றது"), (r"போவது", "போறது"), (r"சொல்வது", "சொல்றது"),
     (r"நாங்கள் இங்கு", "நாங்க இங்க"), (r"அவர்தான்", "அவருதான்"), (r"இவர்தான்", "இவருதான்"), (r"அவள்தான்", "அவதான்"),
     (r"அவன்தான்", "அவன்தான்"), (r"அவர் தான்", "அவருதான்"), (r"இங்கு தான்", "இங்கதான்"), (r"இங்க தான்", "இங்கதான்"),
@@ -668,7 +683,8 @@ def colloquial(text):
 
 # innum 'pustaga Tamil' maadhiri irukkura varigalai kandupidikka
 FORMAL_RE = re.compile(r"(கிறே|கிறா|கிறோ|கிறீ|கிறது|இங்கே|அங்கே|எங்கே|ங்கள்|ார்கள்|ன்றால்|தால்(?![\u0B80-\u0BFF])|"
-                       r"வேண்டும்|இல்லை|ஆனால்|மிகவும்|செய்|கொள்கிறே|இயலும்|இயலாது|வேண்டியது|அவர்களை|உள்ளது|உள்ளன)")
+                       r"வேண்டும்|இல்லை|ஆனால்|மிகவும்|செய்|கொள்கிறே|இயலும்|இயலாது|வேண்டியது|அவர்களை|உள்ளது|உள்ளன|அனைவ|அவ்வாறு|இவ்வாறு|"
+                       r"எவ்வாறு|தாங்கள்|யாது|ஆகிய|கொண்டிருக்|ிருக்கின்ற|இருந்தார்கள்|சென்ற|கூறி|அவனுடைய|அவளுடைய|இன்று|நேற்று)")
 
 
 def step_script(video):
