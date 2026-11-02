@@ -1,5 +1,6 @@
 """
-Tamil Auto-Dubbing Pipeline (Kaggle notebook-ku)
+Multi-language Auto-Dubbing Pipeline (Tamil / Telugu / Malayalam / Kannada / Hindi)
+(Kaggle notebook-ku)
 ================================================
 Video -> BGM pirippu (demucs) -> Gemini: yaar enna pesuranga + pechu Tamil
 -> Gemini TTS (character-ku oru nilaiyana kural) -> BGM + Tamil kural + video
@@ -37,6 +38,35 @@ BGM_VOLUME   = 0.9
 VOICE_VOLUME = 1.0
 SR           = 24000     # Gemini TTS output sample rate
 # ----------------------------------------------------------------------------
+
+
+# ----------------------------- LANGUAGES ------------------------------------
+# code: name, native name, ISO-639-2 tag (video track language), Unicode range of its script,
+#       edge-tts voices, reference sentence (OmniVoice), spoken-style note for the translator
+LANGS = {
+    "ta": dict(name="Tamil", native="தமிழ்", tag="tam", code="ta", rng=(0x0B80, 0x0BFF), script="Tamil",
+               edge={"male": ["ta-IN-ValluvarNeural", "ta-LK-KumarNeural", "ta-MY-SuryaNeural", "ta-SG-AnbuNeural"],
+                     "female": ["ta-IN-PallaviNeural", "ta-LK-SaranyaNeural", "ta-MY-KaniNeural", "ta-SG-VenbaNeural"]},
+               ref="வணக்கம், நான் உங்க கூட கொஞ்சம் பேசணும். இன்னைக்கு என்ன நடந்துச்சுன்னு சொல்லுங்க, நான் கேக்குறேன்.",
+               style="Casual Chennai spoken Tamil (இல்ல, வரேன், பண்றேன், நீங்க, அவங்க), never literary Tamil."),
+    "te": dict(name="Telugu", native="తెలుగు", tag="tel", code="te", rng=(0x0C00, 0x0C7F), script="Telugu",
+               edge={"male": ["te-IN-MohanNeural"], "female": ["te-IN-ShrutiNeural"]},
+               ref="నమస్కారం, నేను మీతో కొంచెం మాట్లాడాలి. ఈ రోజు ఏం జరిగిందో చెప్పండి, నేను వింటున్నాను.",
+               style="Everyday spoken Telugu (వ్యవహారిక భాష) as in Telugu-dubbed movies, never bookish/grandhika Telugu."),
+    "ml": dict(name="Malayalam", native="മലയാളം", tag="mal", code="ml", rng=(0x0D00, 0x0D7F), script="Malayalam",
+               edge={"male": ["ml-IN-MidhunNeural"], "female": ["ml-IN-SobhanaNeural"]},
+               ref="നമസ്കാരം, എനിക്ക് നിങ്ങളോട് കുറച്ച് സംസാരിക്കണം. ഇന്ന് എന്താണ് സംഭവിച്ചതെന്ന് പറയൂ, ഞാൻ കേൾക്കുന്നുണ്ട്.",
+               style="Everyday spoken Malayalam (സംസാരഭാഷ) as in Malayalam-dubbed movies, never bookish Malayalam."),
+    "kn": dict(name="Kannada", native="ಕನ್ನಡ", tag="kan", code="kn", rng=(0x0C80, 0x0CFF), script="Kannada",
+               edge={"male": ["kn-IN-GaganNeural"], "female": ["kn-IN-SapnaNeural"]},
+               ref="ನಮಸ್ಕಾರ, ನಾನು ನಿಮ್ಮ ಜೊತೆ ಸ್ವಲ್ಪ ಮಾತನಾಡಬೇಕು. ಇವತ್ತು ಏನಾಯಿತು ಹೇಳಿ, ನಾನು ಕೇಳುತ್ತಿದ್ದೇನೆ.",
+               style="Everyday spoken Kannada (ಆಡುಮಾತು) as in Kannada-dubbed movies, never bookish Kannada."),
+    "hi": dict(name="Hindi", native="हिन्दी", tag="hin", code="hi", rng=(0x0900, 0x097F), script="Devanagari (Hindi)",
+               edge={"male": ["hi-IN-MadhurNeural"], "female": ["hi-IN-SwaraNeural"]},
+               ref="नमस्ते, मुझे आपसे थोड़ी बात करनी है। आज क्या हुआ, बताइए, मैं सुन रहा हूँ।",
+               style="Natural everyday spoken Hindi (बोलचाल की हिंदी) as in Hindi-dubbed movies and OTT series; simple words, not shuddh/Sanskritised Hindi."),
+}
+LANG_ORDER = ["ta", "te", "ml", "kn", "hi"]
 
 
 class Cancelled(Exception):
@@ -247,7 +277,7 @@ Return ONLY JSON:
                    "pitch":"low|mid|high","tone":"short English description of voice/personality",
                    "is_new": true}} ],
  "lines": [ {{"start":"00:01.2","end":"00:03.9","speaker":"C1",
-              "original":"original words","tamil":"colloquial Tamil",
+              "original":"original words","english":"short natural English meaning","tamil":"colloquial Tamil",
               "emotion":"neutral|angry|sad|happy|scared|whisper|shout|calm"}} ]
 }}
 Only list characters that appear in this clip in "characters"."""
@@ -381,6 +411,7 @@ def run_clip(clip, off, chars):
         out.append({"start": round(s_, 2), "end": round(e_, 2),
                     "speaker": ln.get("speaker", "C1"),
                     "original": ln.get("original", ""),
+                    "english": ln.get("english", ""),
                     "tamil": ln["tamil"].strip(),
                     "emotion": ln.get("emotion", "neutral")})
     return out
@@ -743,6 +774,19 @@ def step_script(video):
     for sp in {l["speaker"] for l in lines}:
         chars.setdefault(sp, {"id": sp, "gender": "male", "age": "adult",
                               "pitch": "mid", "tone": "neutral"})
+    out = {"characters": chars, "lines": lines, "tamil_done": False}
+    json.dump(out, open(script_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    print(f"  {len(lines)} varigal, {len(chars)} characters")
+    return out
+
+
+def finish_tamil(script):
+    """Tamil mattum thervu aanaa: Tamil-a movie-dub pechu nadaikku maathi script.json-la save pannum."""
+    if script.get("tamil_done"):
+        return
+    lines, chars = script["lines"], script["characters"]
+    for ln in lines:
+        ln.setdefault("tamil", "")
     polish(lines, chars)
     for ln in lines:                                       # kadaisiyaa pechu-Tamil-a urudhi seyyum
         ln["tamil"] = colloquial(ln["tamil"])
@@ -752,10 +796,96 @@ def step_script(video):
         polish(still, chars, strict=True)
         for ln in still:
             ln["tamil"] = colloquial(ln["tamil"])
-    out = {"characters": chars, "lines": lines}
-    json.dump(out, open(script_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-    print(f"  {len(lines)} varigal, {len(chars)} characters")
-    return out
+    script["tamil_done"] = True
+    json.dump(script, open(os.path.join(WORK, "script.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+
+
+TRANSLATE_PROMPT = """You are the top dubbing dialogue writer for {name} movies and web series (the kind of dub people
+watch on TV/OTT). Translate every line below into natural SPOKEN {name}, exactly how real people talk in daily
+conversation and in a professional {name} dub. {style}
+Rules:
+- Write ONLY in {script} script. Common everyday English loanwords (ok, sorry, please, time, phone) may be written in
+  {script} script. NO Latin letters, NO explanations, NO transliteration notes.
+- Keep meaning, emotion and energy of the original. Match the speaker (age, gender, mood). Short, speakable sentences.
+- TIME FIT: each item has "sec" = seconds available. The translated line must be speakable in about that time
+  (max roughly {cps} characters per second). Shorten wording if needed, never drop the meaning.
+- Use prev/next only to understand the scene, do not translate them.
+Input items: id, who, emotion, src (original words), en (English meaning), sec, prev, next.
+Return ONLY JSON: {{"lines":[{{"id":0,"text":"..."}}]}} with EVERY id exactly once.
+
+INPUT:
+{items}"""
+
+
+def in_script(text, rng):
+    letters = [ch for ch in str(text) if ch.isalpha()]
+    if not letters:
+        return False
+    hit = sum(1 for ch in letters if rng[0] <= ord(ch) <= rng[1])
+    return hit / len(letters) >= 0.6
+
+
+def step_translate(script, lang):
+    """Ellaa varigalaiyum {lang}-la mozhipeyarkkum. Cache: work/script_<lang>.json. Tamil -> script['tamil']."""
+    lines, chars = script["lines"], script["characters"]
+    if lang == "ta":
+        return [str(ln.get("tamil", "")) for ln in lines]
+    L = LANGS[lang]
+    path = os.path.join(WORK, f"script_{lang}.json")
+    texts = [""] * len(lines)
+    if os.path.exists(path):
+        try:
+            old = json.load(open(path, encoding="utf-8"))
+            if isinstance(old, list) and len(old) == len(lines):
+                texts = [str(t) for t in old]
+        except Exception:  # noqa
+            pass
+    todo = [i for i in range(len(lines)) if not in_script(texts[i], L["rng"])]
+    if not todo:
+        return texts
+    print(f"  {L['name']} mozhipeyarpu: {len(todo)}/{len(lines)} varigal...")
+    B = 25
+    for a in range(0, len(todo), B):
+        check_cancel()
+        ids = todo[a: a + B]
+        for attempt in range(3):
+            need = [i for i in ids if not in_script(texts[i], L["rng"])]
+            if not need:
+                break
+            items = []
+            for k, i in enumerate(need):
+                ln = lines[i]
+                c = chars.get(ln["speaker"], {})
+                prv = lines[i - 1] if i > 0 else {}
+                nxt = lines[i + 1] if i + 1 < len(lines) else {}
+                items.append({"id": k,
+                              "who": f"{c.get('age', 'adult')} {c.get('gender', 'male')} ({c.get('tone', '')})",
+                              "emotion": ln.get("emotion", "neutral"),
+                              "src": ln.get("original", ""), "en": ln.get("english", "") or ln.get("original", ""),
+                              "sec": round(max(0.6, ln["end"] - ln["start"]), 1),
+                              "prev": prv.get("english") or prv.get("original", ""),
+                              "next": nxt.get("english") or nxt.get("original", "")})
+            prompt = TRANSLATE_PROMPT.format(name=L["name"], style=L["style"], script=L["script"],
+                                             cps=14, items=json.dumps(items, ensure_ascii=False))
+            if attempt:
+                prompt = (f"IMPORTANT: answer ONLY in {L['script']} script, every line, no Latin letters.\n\n" + prompt)
+            try:
+                resp = gen(prompt, types.GenerateContentConfig(
+                    response_mime_type="application/json", temperature=0.4), what=f"translate-{lang}")
+                data = parse_json(resp.text)
+                for it in data.get("lines", []):
+                    k = int(it["id"])
+                    t = str(it.get("text", "")).strip()
+                    if 0 <= k < len(need) and t and in_script(t, L["rng"]):
+                        texts[need[k]] = t
+            except Exception as e:  # noqa
+                print(f"  translate {lang} fail (try {attempt + 1}/3): {str(e)[:150]}")
+                time.sleep(3)
+        json.dump(texts, open(path, "w", encoding="utf-8"), ensure_ascii=False)
+    missing = sum(1 for t in texts if not in_script(t, L["rng"]))
+    if missing:
+        print(f"  {missing} varigal {L['name']}-la mozhipeyarkka mudiyala")
+    return texts
 
 
 # ----------------------------- STEP 3: voices -------------------------------
@@ -802,14 +932,15 @@ def assign_voices(chars):
     return mapping
 
 
-def style_text(c, emotion):
+def style_text(c, emotion, lang="ta"):
     age = c.get("age", "adult")
     g = c.get("gender", "male")
     who = "a child" if age == "child" else f"a {age} {g}"
-    return (f"You are the Tamil dubbing voice actor for {who} in a professional Tamil movie dub. "
+    nm = LANGS[lang]["name"]
+    return (f"You are the {nm} dubbing voice actor for {who} in a professional {nm} movie dub. "
             f"Voice character: {c.get('tone','natural')}. Current emotion: {emotion}. "
-            f"Speak casual, everyday spoken Tamil exactly as written, with a relaxed conversational rhythm "
-            f"and real acting emotion, like dialogue in a Tamil film. Not like a news reader and not formal. "
+            f"Speak casual, everyday spoken {nm} exactly as written, with a relaxed conversational rhythm "
+            f"and real acting emotion, like dialogue in a {nm} film. Not like a news reader and not formal. "
             f"Read only the user's text, never read these instructions.")
 
 
@@ -905,14 +1036,9 @@ def tts(text, voice, system):
 
 
 _state_tts = {"fails": 0, "dead_until": 0.0}
-EDGE_POOL = {
-    "male": ["ta-IN-ValluvarNeural", "ta-LK-KumarNeural", "ta-MY-SuryaNeural", "ta-SG-AnbuNeural"],
-    "female": ["ta-IN-PallaviNeural", "ta-LK-SaranyaNeural", "ta-MY-KaniNeural", "ta-SG-VenbaNeural"],
-}
-
-
-def assign_edge_voices(chars):
+def assign_edge_voices(chars, lang="ta"):
     """Ovvoru character-kum vera voice + vera pitch (ellarukkum ore kural varaadhu)."""
+    pool = LANGS[lang]["edge"]
     cnt = {"male": 0, "female": 0}
     out = {}
     for cid, c in chars.items():
@@ -920,10 +1046,12 @@ def assign_edge_voices(chars):
         g = g if g in cnt else "male"
         k = cnt[g]
         cnt[g] += 1
-        voice = EDGE_POOL[g][k % 4]
+        n = len(pool[g])
+        voice = pool[g][k % n]
         hz = {"child": 45, "young": 8, "adult": 0, "elder": -12}.get(c.get("age", "adult"), 0)
         hz += {"high": 14, "mid": 0, "low": -14}.get(c.get("pitch", "mid"), 0)
-        hz += (k // 4) * (-10 if k % 8 < 4 else 10)        # 4-kku mela irundhaa pitch maathi
+        r = k // n                                           # ore voice thirumba vandha pitch maathi
+        hz += (0, -10, 10, -20, 20)[min(r, 4)] if n else 0
         out[cid] = (voice, int(max(-50, min(50, hz))))
     return out
 
@@ -953,11 +1081,11 @@ def edge_tts_np(text, ev, emotion="neutral"):
                 os.remove(t)
 
 
-def speak(text, voice, system, ev, emotion="neutral", cid=None):
+def speak(text, voice, system, ev, emotion="neutral", cid=None, lang="ta"):
     """OmniVoice -> Gemini -> edge-tts. (ethuvum fail aanaa exception)"""
     if cid is not None and OMNI["model"] is not None:
         try:
-            a = omni_speak(text, cid, ev, emotion)
+            a = omni_speak(text, cid, ev, emotion, lang)
             if a is not None:
                 OMNI["fails"] = 0
                 return a
@@ -988,9 +1116,10 @@ def speak(text, voice, system, ev, emotion="neutral", cid=None):
     raise RuntimeError(f"edge-tts fail: {str(last)[:100]}")
 
 
-def shorten(text, ratio):
-    prompt = (f"Shorten this colloquial Tamil dubbing line to about {int(ratio*100)}% of its length. "
-              f"Keep meaning and tone, keep it spoken Tamil. Return ONLY the Tamil text.\n\n{text}")
+def shorten(text, ratio, lang="ta"):
+    nm = LANGS[lang]["name"]
+    prompt = (f"Shorten this colloquial {nm} dubbing line to about {int(ratio*100)}% of its length. "
+              f"Keep meaning and tone, keep it spoken {nm}, keep the same script. Return ONLY the {nm} text.\n\n{text}")
     r = gen(prompt, what="shorten")
     return r.text.strip().strip('"')
 
@@ -1034,7 +1163,7 @@ OMNI_ENABLE = os.environ.get("OMNIVOICE", "1") != "0"        # 0 -> OmniVoice of
 OMNI_REF = os.environ.get("OMNI_REF", "orig")                # edge = Tamil kural reference (Tamil uchcharippu), orig = asal nadigar kural clone
 OMNI_PACE = os.environ.get("OMNI_PACE", "none")                # edge = Tamil TTS-oda vegam/nadai-ya eduthukkum, speed = OMNI_SPEED, none = model-oda vegam
 OMNI_SPEED = float(os.environ.get("OMNI_SPEED", "1.0"))     # OMNI_PACE=speed na use aagum (1.0 = normal)
-OMNI_LANG = os.environ.get("OMNI_LANG", "")                    # "ta" kuduthaa language-a sollum (default: sollaadhu - munnaadi mathiri)
+OMNI_LANG = os.environ.get("OMNI_LANG", "")                    # "auto" -> ovvoru mozhikkum adhoda code-a sollum | "ta" pola kuduthaa adhai ellaathukkum                    # "ta" kuduthaa language-a sollum (default: sollaadhu - munnaadi mathiri)
 EDGE_REF_TEXT = "வணக்கம், நான் உங்க கூட கொஞ்சம் பேசணும். இன்னைக்கு என்ன நடந்துச்சுன்னு சொல்லுங்க, நான் கேக்குறேன்."
 OMNI = {"model": None, "refs": {}, "tried": False, "fails": 0, "off_until": 0.0}
 _omni_lock = threading.Lock()
@@ -1070,15 +1199,18 @@ def omni_load():
     return OMNI["model"]
 
 
-def omni_prepare_refs(chars, lines, edge_voices):
+def omni_prepare_refs(chars, lines, edge_voices, lang="ta"):
     """Ovvoru character-kum oru reference kural clip thayaar pannum."""
     voc = os.path.join(WORK, "vocals.wav")
     mask = None
+    OMNI["refs"] = {}
     if OMNI_REF != "edge" and os.path.exists(voc):
         try:
             mask = speech_mask(voc)
         except Exception:  # noqa
             mask = None
+    ref_text = LANGS[lang]["ref"]
+    first_edge = LANGS[lang]["edge"]["male"][0]
     for cid in chars:
         path = os.path.join(WORK, f"ref_{cid}.wav")
         got = None
@@ -1102,10 +1234,11 @@ def omni_prepare_refs(chars, lines, edge_voices):
                 if r.returncode == 0 and os.path.exists(path):
                     got = (path, best["original"])
         if got is None and OMNI_REF != "orig_only":
-            try:                                             # asal clip illa -> edge-tts Tamil clip reference
-                ev = edge_voices.get(cid, ("ta-IN-ValluvarNeural", 0))
-                write_wav(path, edge_tts_np(EDGE_REF_TEXT, ev), SR)
-                got = (path, EDGE_REF_TEXT)
+            epath = os.path.join(WORK, f"ref_{lang}_{cid}.wav")
+            try:                                             # asal clip illa -> edge-tts clip reference (andha mozhiyil)
+                ev = edge_voices.get(cid, (first_edge, 0))
+                write_wav(epath, edge_tts_np(ref_text, ev), SR)
+                got = (epath, ref_text)
             except Exception as e:  # noqa
                 print(f"  ref {cid} fail: {str(e)[:100]}")
         if got:
@@ -1113,13 +1246,13 @@ def omni_prepare_refs(chars, lines, edge_voices):
     print(f"  OmniVoice reference: {len(OMNI['refs'])}/{len(chars)} characters")
 
 
-def omni_speak(text, cid, ev=None, emotion="neutral"):
+def omni_speak(text, cid, ev=None, emotion="neutral", lang="ta"):
     m, ref = OMNI["model"], OMNI["refs"].get(cid)
     if m is None or ref is None or time.time() < OMNI["off_until"]:
         return None
     kw = {}
     if OMNI_PACE == "edge" and ev is not None:
-        try:                                                 # asal Tamil TTS evvalavu neram pesuthu -> adhey vegam
+        try:                                                 # asal TTS evvalavu neram pesuthu -> adhey vegam
             kw["duration"] = round(len(edge_tts_np(text, ev, emotion)) / SR + 0.15, 2)
         except Exception:  # noqa
             kw = {}
@@ -1127,7 +1260,7 @@ def omni_speak(text, cid, ev=None, emotion="neutral"):
         kw["speed"] = OMNI_SPEED
     with _omni_lock:                                         # oru GPU model -> orey nerathula onnu
         if OMNI_LANG:
-            kw["language"] = OMNI_LANG
+            kw["language"] = LANGS[lang]["code"] if OMNI_LANG.lower() in ("auto", "1", "on", "yes") else OMNI_LANG
         out = m.generate(text=text, ref_audio=ref[0], ref_text=ref[1], **kw)
     a = np.asarray(out[0] if isinstance(out, (list, tuple)) else out, dtype=np.float32).reshape(-1)
     if len(a) < int(0.2 * SR):
@@ -1135,42 +1268,54 @@ def omni_speak(text, cid, ev=None, emotion="neutral"):
     return trim_silence(a)
 
 
-def step_tts(script):
+def step_tts(script, texts, lang="ta", p0=50, p1=90):
     chars, lines = script["characters"], script["lines"]
+    L = LANGS[lang]
     voices = assign_voices(chars)
-    edge_voices = assign_edge_voices(chars)
-    print("[3] Kural thervu:", {k: voices[k] for k in voices})
-    print(f"[4] {len(lines)} varigalukku Tamil kural uruvaakkurom...")
+    edge_voices = assign_edge_voices(chars, lang)
+    tdir = os.path.join(WORK, "tts", lang)
+    os.makedirs(tdir, exist_ok=True)
+    print(f"[3] Kural thervu ({L['name']}):", {k: voices[k] for k in voices})
+    print(f"[4] {len(lines)} varigalukku {L['name']} kural uruvaakkurom...")
     if omni_load():
-        _P("🧠 OmniVoice குரல்களை தயார் பண்றேன்...", 50)
-        omni_prepare_refs(chars, lines, edge_voices)
+        _P("🧠 OmniVoice குரல்களை தயார் பண்றேன்...", p0)
+        omni_prepare_refs(chars, lines, edge_voices, lang)
+    todo = [i for i in range(len(lines)) if str(texts[i]).strip()]
+    first_edge = L["edge"]["male"][0]
+
+    def wav_path(i):
+        return os.path.join(tdir, f"{i:05d}.wav")
 
     def work(i):
         check_cancel()
         ln = lines[i]
-        path = os.path.join(WORK, "tts", f"{i:05d}.wav")
+        path = wav_path(i)
         if os.path.exists(path):
             return i, read_wav(path)
         c = chars.get(ln["speaker"], {})
-        system = style_text(c, ln.get("emotion", "neutral"))
-        text = ln["tamil"]
+        system = style_text(c, ln.get("emotion", "neutral"), lang)
+        text = texts[i]
         nxt = lines[i + 1]["start"] if i + 1 < len(lines) else ln["end"] + 1.5
         orig_len = ln["end"] - ln["start"]
         allowed = max(orig_len, min(nxt - ln["start"] - 0.05, orig_len * 1.6 + 0.5))
-        ev = edge_voices.get(ln["speaker"], ("ta-IN-ValluvarNeural", 0))
+        ev = edge_voices.get(ln["speaker"], (first_edge, 0))
         emo = ln.get("emotion", "neutral")
+        vname = voices.get(ln["speaker"], "Kore")
         try:
-            audio = speak(text, voices.get(ln["speaker"], "Kore"), system, ev, emo, ln["speaker"])
+            audio = speak(text, vname, system, ev, emo, ln["speaker"], lang)
         except Exception as e:  # noqa
             print(f"  line {i} TTS fail: {str(e)[:120]}")
             return i, np.zeros(int(0.1 * SR), dtype=np.float32)
         dur = len(audio) / SR
         if dur > allowed * 1.25 and len(text) > 12:
             try:
-                short = colloquial(shorten(text, max(0.5, allowed / dur)))
-                audio = speak(short, voices.get(ln["speaker"], "Kore"), system, ev, emo, ln["speaker"])
-                ln["tamil_short"] = short
-                dur = len(audio) / SR
+                short = shorten(text, max(0.5, allowed / dur), lang)
+                if lang == "ta":
+                    short = colloquial(short)
+                if in_script(short, L["rng"]):
+                    audio = speak(short, vname, system, ev, emo, ln["speaker"], lang)
+                    ln.setdefault("short", {})[lang] = short
+                    dur = len(audio) / SR
             except Exception as e:  # noqa
                 print(f"  line {i} shorten fail: {str(e)[:100]}")
         if dur > allowed:
@@ -1179,17 +1324,17 @@ def step_tts(script):
         write_wav(path, audio)
         return i, audio
 
-    results = {}
+    results = {i: np.zeros(0, dtype=np.float32) for i in range(len(lines))}
     with ThreadPoolExecutor(max_workers=TTS_WORKERS) as ex:
-        for k, (i, a_) in enumerate(ex.map(work, range(len(lines)))):
+        for k, (i, a_) in enumerate(ex.map(work, todo)):
             results[i] = a_
-            _P(f"🎙️ தமிழ் குரல் உருவாக்குறேன் ({k+1}/{len(lines)} வரிகள்)", 50 + 40 * (k + 1) / max(1, len(lines)))
+            _P(f"🎙️ {L['native']} குரல் உருவாக்குறேன் ({k+1}/{len(todo)} வரிகள்)",
+               p0 + (p1 - p0) * 0.9 * (k + 1) / max(1, len(todo)))
             if k % 10 == 0:
-                print(f"  {k+1}/{len(lines)}")
+                print(f"  {k+1}/{len(todo)}")
     # fail aana varigalai thaniya marubadi (cache-la illaadhavai)
     for rnd in range(2):
-        failed = [i for i in range(len(lines))
-                  if not os.path.exists(os.path.join(WORK, "tts", f"{i:05d}.wav"))]
+        failed = [i for i in todo if not os.path.exists(wav_path(i))]
         if not failed:
             break
         print(f"  {len(failed)} varigal fail aachu, marubadi try (round {rnd+1})...")
@@ -1197,9 +1342,9 @@ def step_tts(script):
         for i in failed:
             check_cancel()
             _, results[i] = work(i)
-    failed = [i for i in range(len(lines))
-              if not os.path.exists(os.path.join(WORK, "tts", f"{i:05d}.wav"))]
+    failed = [i for i in todo if not os.path.exists(wav_path(i))]
     STATS["tts_failed"] = len(failed)
+    STATS["untranslated"] = len(lines) - len(todo)
     return [results[i] for i in range(len(lines))]
 
 
@@ -1240,50 +1385,66 @@ def keep_original_where_undubbed(track, lines, audios):
     return kept
 
 
-def step_mix(video, bgm, lines, audios):
+def mix_language(total, bgm, lines, audios, lang):
+    """Oru mozhiyin kural + BGM-a kalandhu oru audio file (m4a) aakkum. Video length-ke sariyaa irukkum."""
     check_cancel()
-    print("[5] Ellathaiyum serkkirom...")
-    total = duration(video)
     track = np.zeros(int((total + 5) * SR), dtype=np.float32)
     for ln, a in zip(lines, audios):
         s = int(ln["start"] * SR)
         e = min(len(track), s + len(a))
-        if s < len(track):
+        if s < len(track) and e > s:
             track[s:e] += a[: e - s]
     STATS["orig_kept"] = keep_original_where_undubbed(track, lines, audios)
     peak = np.abs(track).max()
     if peak > 1.0:
         track /= peak
-    dub_wav = os.path.join(WORK, "dub_track.wav")
+    dub_wav = os.path.join(WORK, f"dub_track_{lang}.wav")
     write_wav(dub_wav, track)
-    is_mkv = OUTPUT_VIDEO.lower().endswith(".mkv")
+    out = os.path.join(WORK, f"mix_{lang}.m4a")
 
     def build(norm):
         n = ":normalize=0" if norm else ""
-        fc = (f"[1:a]volume={BGM_VOLUME}[b];[2:a]aresample=44100,volume={VOICE_VOLUME}[d];"
+        fc = (f"[0:a]volume={BGM_VOLUME}[b];[1:a]aresample=44100,volume={VOICE_VOLUME}[d];"
               f"[b][d]amix=inputs=2:duration=first:dropout_transition=0{n}[m];"
-              f"[m]alimiter=limit=0.95[a]")
-        cmd = (f'ffmpeg -y -i "{video}" -i "{bgm}" -i "{dub_wav}" -filter_complex "{fc}" '
-               f'-map 0:v -map "[a]" ')
-        if is_mkv:
-            # MKV: Tamil dub mudhal track (default) + asal audio rendavadhu track
-            cmd += ('-map 0:a:0? -c:v copy -c:a aac -b:a 192k '
-                    '-metadata:s:a:0 language=tam -metadata:s:a:0 title="Tamil Dub" '
-                    '-metadata:s:a:1 language=und -metadata:s:a:1 title="Original" '
-                    '-disposition:a:0 default -disposition:a:1 0 ')
-        else:
-            cmd += '-c:v copy -c:a aac -b:a 192k -movflags +faststart '
-        return cmd + f'-shortest "{OUTPUT_VIDEO}"'
+              f"[m]alimiter=limit=0.95,apad[a]")
+        return (f'ffmpeg -y -i "{bgm}" -i "{dub_wav}" -filter_complex "{fc}" -map "[a]" '
+                f'-c:a aac -b:a 192k -ar 44100 -ac 2 -t {total:.3f} "{out}"')
 
     r = sh(build(True), check=False)
     if r.returncode != 0:  # pazhaya ffmpeg-la normalize illa
         sh(build(False))
+    return out
+
+
+def mux_all(video, mixes, fmt):
+    """Ellaa mozhi audio track-aiyum ORE video file-la serkkum (thaniththaniyaa varaadhu)."""
+    check_cancel()
+    is_mkv = fmt == "mkv"
+    n = len(mixes)
+    inputs = f'-i "{video}" ' + "".join(f'-i "{p}" ' for _, p in mixes)
+    maps = "-map 0:v:0 " + "".join(f"-map {k + 1}:a " for k in range(n))
+    if is_mkv:
+        maps += "-map 0:a:0? "                      # asal audio kadaisi track-aa
+    meta = ""
+    for k, (lang, _) in enumerate(mixes):
+        L = LANGS[lang]
+        meta += f'-metadata:s:a:{k} language={L["tag"]} -metadata:s:a:{k} title="{L["name"]} Dub" '
+    if is_mkv:
+        meta += f'-metadata:s:a:{n} language=und -metadata:s:a:{n} title="Original" '
+    disp = "-disposition:a:0 default " + "".join(
+        f"-disposition:a:{k} 0 " for k in range(1, n + (1 if is_mkv else 0)))
+    tail = "" if is_mkv else "-movflags +faststart "
+    out = f'"{OUTPUT_VIDEO}"'
+    r = sh(f"ffmpeg -y {inputs}{maps}-c copy {meta}{disp}{tail}{out}", check=False)
+    if r.returncode != 0:                           # video codec container-ku set aagala -> re-encode
+        print("  copy fail, video-va re-encode pannuren:", r.stderr[-200:])
+        sh(f"ffmpeg -y {inputs}{maps}-c:v libx264 -preset veryfast -crf 20 -c:a copy {meta}{disp}{tail}{out}")
     print(f"\nMudinjadhu -> {OUTPUT_VIDEO}")
 
 
 # ----------------------------- MAIN -----------------------------------------
-def dub(video, job_dir, progress=print, fmt="mp4", cancel=None):
-    """Oru video-va Tamil-la dub panni output path-a tharum. (Bot idhai kooppidum)"""
+def dub(video, job_dir, progress=print, fmt="mp4", cancel=None, langs=("ta",)):
+    """Oru video-va thervu seytha mozhi(galil) dub panni, ORE video file-aa output path-a tharum. (Bot idhai kooppidum)"""
     global WORK, OUTPUT_VIDEO, CANCEL, _P
     CANCEL = cancel if cancel is not None else threading.Event()
 
@@ -1294,28 +1455,46 @@ def dub(video, job_dir, progress=print, fmt="mp4", cancel=None):
             progress(msg)
         except Exception:  # noqa
             pass
+    langs = [l for l in LANG_ORDER if l in set(langs)] or ["ta"]
     WORK = os.path.join(job_dir, "work")
-    fmt = "mkv" if str(fmt).lower() == "mkv" else "mp4"
-    OUTPUT_VIDEO = os.path.join(job_dir, f"dubbed_tamil.{fmt}")
+    fmt = "mkv" if (str(fmt).lower() == "mkv" or len(langs) > 1) else "mp4"   # pala mozhi -> orey MKV
+    OUTPUT_VIDEO = os.path.join(job_dir, f"dubbed_{'_'.join(langs)}.{fmt}")
     os.makedirs(os.path.join(WORK, "tts"), exist_ok=True)
-    _P(f"Video: {duration(video)/60:.1f} நிமிடம். BGM பிரிக்கிறேன்...", 10)
+    total = duration(video)
+    _P(f"Video: {total/60:.1f} நிமிடம். BGM பிரிக்கிறேன்...", 10)
     bgm = step_bgm(video)
     check_cancel()
-    _P("📝 Script எழுதுறேன் (யார் என்ன பேசுறாங்க + பேச்சுத் தமிழ்)...", 30)
+    _P("📝 Script எழுதுறேன் (யார் என்ன பேசுறாங்க + நேரம்)...", 30)
     script = step_script(video)
+    if "ta" in langs and not script.get("tamil_done"):
+        _P("📝 தமிழை பேச்சு நடைக்கு மாத்துறேன்...", 46)
+        finish_tamil(script)
     ls = script["lines"]
     span = f" ({ls[0]['start']:.0f}s - {ls[-1]['end']:.0f}s)" if ls else ""
-    _P(f"{len(ls)} வரிகள்{span}, {len(script['characters'])} characters. தமிழ் குரல் உருவாக்குறேன்...", 50)
-    audios = step_tts(script)
-    if STATS["tts_failed"]:
-        progress(f"⚠️ {STATS['tts_failed']} வரிகளுக்கு குரல் வரல (Gemini limit). மறுபடி அனுப்பிப் பாருங்க.")
-    _P("🎬 எல்லாத்தையும் சேர்க்கிறேன்...", 92)
-    step_mix(video, bgm, script["lines"], audios)
-    if STATS.get("orig_kept"):
-        progress(f"⚠️ {STATS['orig_kept']} இடங்களுக்கு dub குரல் கிடைக்கல, அங்க அசல் குரல் இருக்கும்.")
+    names = " + ".join(LANGS[l]["native"] for l in langs)
+    _P(f"{len(ls)} வரிகள்{span}, {len(script['characters'])} characters. {names} குரல் உருவாக்குறேன்...", 50)
+    mixes, n = [], len(langs)
+    for k, lang in enumerate(langs):
+        check_cancel()
+        L = LANGS[lang]
+        p0, p1 = 50 + 40 * k / n, 50 + 40 * (k + 1) / n
+        _P(f"🌐 {L['native']} மொழிபெயர்க்கிறேன்...", p0)
+        texts = step_translate(script, lang)
+        audios = step_tts(script, texts, lang, p0, p1)
+        if STATS["tts_failed"]:
+            progress(f"⚠️ {L['native']}: {STATS['tts_failed']} வரிகளுக்கு குரல் வரல (Gemini limit). மறுபடி அனுப்பிப் பாருங்க.")
+        if STATS.get("untranslated"):
+            progress(f"⚠️ {L['native']}: {STATS['untranslated']} வரிகளை மொழிபெயர்க்க முடியல, அங்க அசல் குரல் இருக்கும்.")
+        _P(f"🎬 {L['native']} audio கலக்கிறேன்...", p1)
+        mixes.append((lang, mix_language(total, bgm, script["lines"], audios, lang)))
+        del audios
+        if STATS.get("orig_kept"):
+            progress(f"⚠️ {L['native']}: {STATS['orig_kept']} இடங்களுக்கு dub குரல் கிடைக்கல, அங்க அசல் குரல் இருக்கும்.")
+    _P("🎬 எல்லாத்தையும் ஒரே வீடியோவில் சேர்க்கிறேன்...", 94)
+    mux_all(video, mixes, fmt)
     return OUTPUT_VIDEO
 
 
 if __name__ == "__main__":
     video = find_video()
-    dub(video, OUT_DIR)
+    dub(video, OUT_DIR, langs=[x for x in os.environ.get("DUB_LANGS", "ta").split(",") if x])
