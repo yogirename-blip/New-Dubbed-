@@ -39,6 +39,33 @@ client = TelegramClient(os.path.join(BASE, "bot_session"), API_ID, API_HASH)
 queue: asyncio.Queue = asyncio.Queue()
 
 
+SETTINGS = {}  # user_id -> {"fmt": "mp4|mkv", "send": "video|document"}
+
+
+def prefs(uid):
+    return SETTINGS.setdefault(uid, {"fmt": "mp4", "send": "video"})
+
+
+def describe(p):
+    send = "document (file)" if p["send"] == "document" or p["fmt"] == "mkv" else "video"
+    return f"Format: {p['fmt'].upper()} | அனுப்பும் முறை: {send}"
+
+
+@client.on(events.NewMessage(pattern=r"^/(mp4|mkv|video|document|settings)"))
+async def set_pref(event):
+    cmd = event.raw_text.split()[0].lstrip("/").split("@")[0].lower()
+    p = prefs(event.sender_id)
+    if cmd in ("mp4", "mkv"):
+        p["fmt"] = cmd
+    elif cmd in ("video", "document"):
+        p["send"] = cmd
+    extra = ""
+    if p["fmt"] == "mkv":
+        extra = "\n(MKV: தமிழ் + அசல் ஆடியோ இரண்டு track இருக்கும். Telegram-ல் file-ஆகத்தான் போகும்.)"
+    await event.reply("✅ " + describe(p) + extra +
+                      "\n\nமாற்ற: /mp4 /mkv /video /document")
+
+
 def is_video(msg):
     if msg.video:
         return True
@@ -49,7 +76,8 @@ def is_video(msg):
 @client.on(events.NewMessage(pattern="/start"))
 async def start(event):
     await event.reply("வணக்கம்! 🎬 ஒரு வீடியோ அனுப்புங்க, நான் அதை பேச்சுத் தமிழில் dub செய்து திருப்பி அனுப்புறேன்.\n"
-                      "(நீளமான வீடியோவுக்கு நேரம் ஆகும். ஒரு நேரத்தில் ஒரு வீடியோ மட்டும்.)")
+                      "(நீளமான வீடியோவுக்கு நேரம் ஆகும். ஒரு நேரத்தில் ஒரு வீடியோ மட்டும்.)\n\n"
+                      "வடிவம் மாற்ற: /mp4 /mkv   |   அனுப்பும் முறை: /video /document   |   /settings")
 
 
 @client.on(events.NewMessage(pattern="/id"))
@@ -66,7 +94,11 @@ async def on_file(event):
         await event.reply("வீடியோ file மட்டும் அனுப்புங்க.")
         return
     pos = queue.qsize() + 1
-    await event.reply(f"வீடியோ கிடைத்தது ✅ வரிசை எண்: {pos}")
+    p = prefs(event.sender_id)
+    cap = (event.raw_text or "").lower()          # caption-la 'mkv' / 'doc' ezhuthina adhu mudhal
+    event.job_fmt = "mkv" if "mkv" in cap else ("mp4" if "mp4" in cap else p["fmt"])
+    event.job_send = "document" if ("doc" in cap or "file" in cap) else p["send"]
+    await event.reply(f"வீடியோ கிடைத்தது ✅ வரிசை எண்: {pos}\n{describe({'fmt': event.job_fmt, 'send': event.job_send})}")
     await queue.put(event)
 
 
@@ -90,10 +122,12 @@ async def worker():
             def progress(msg):
                 asyncio.run_coroutine_threadsafe(say(event, "⏳ " + msg), loop)
 
-            out = await asyncio.to_thread(tamil_dub.dub, src, job, progress)
+            out = await asyncio.to_thread(tamil_dub.dub, src, job, progress, event.job_fmt)
             await say(event, "முடிந்தது! அனுப்புறேன்...")
+            as_doc = event.job_send == "document" or event.job_fmt == "mkv"
             await client.send_file(event.chat_id, out, caption="தமிழ் dub 🎧",
-                                   supports_streaming=True, reply_to=event.id)
+                                   force_document=as_doc,
+                                   supports_streaming=not as_doc, reply_to=event.id)
         except Exception as e:  # noqa
             traceback.print_exc()
             await say(event, f"❌ பிழை: {str(e)[:300]}")
