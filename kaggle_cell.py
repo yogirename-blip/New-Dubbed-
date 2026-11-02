@@ -13,11 +13,14 @@ subprocess.run("pip install -q -r /kaggle/working/bot/requirements.txt && pip in
 # pyannote (விருப்பம்): நிறுவ முடியலன்னா பரவாயில்ல, bot தானா WavLM முறைக்கு மாறும்
 subprocess.run("pip install -q pyannote.audio", shell=True)
 
+# IndicF5 (தமிழ் குரல் clone மாடல்)
+subprocess.run("pip install -q git+https://github.com/ai4bharat/IndicF5.git", shell=True)
+
 from kaggle_secrets import UserSecretsClient
 s = UserSecretsClient()
-for k in ["API_ID", "API_HASH", "BOT_TOKEN", "GEMINI_API_KEY"]:
+for k in ["API_ID", "API_HASH", "BOT_TOKEN", "GEMINI_API_KEY", "HF_TOKEN"]:   # HF_TOKEN இப்போ கட்டாயம் (IndicF5)
     os.environ[k] = s.get_secret(k)
-for k in ["HF_TOKEN", "OWNER_ID"]:          # விருப்பம் (OWNER_ID = உன் Telegram user id)
+for k in ["OWNER_ID"]:                      # விருப்பம் (OWNER_ID = உன் Telegram user id)
     try:
         os.environ[k] = s.get_secret(k)
     except Exception:
