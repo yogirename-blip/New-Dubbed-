@@ -226,7 +226,8 @@ dialogue in Tamil-dubbed movies. NEVER literary/formal Tamil (sentamil).
 Examples: "என்ன சொல்கிறாய்?" -> "என்ன சொல்ற?",  "நான் வருகிறேன்" -> "நான் வரேன்",
 "அது இருக்கிறது" -> "அது இருக்கு",  "எனக்கு வேண்டும்" -> "எனக்கு வேணும்",  "ஆனால்" -> "ஆனா",
 "இல்லை" -> "இல்ல",  "நீங்கள்" -> "நீங்க",  "அவர்கள்" -> "அவங்க",  "பிறகு" -> "அப்புறம்".
-Imagine real friends / family chatting casually and write what THAT character would really say in THAT situation
+Write the Tamil exactly like a real Tamil speaker talks in a casual voice message to a friend: relaxed slang,
+one consistent casual register, never formal. Imagine real friends / family chatting casually and write what THAT character would really say in THAT situation
 (a kid talks like a kid, an angry man like an angry man, a boss like a boss). Use everyday English words in Tamil
 script when natural (டைம், பிளான், ப்ராப்ளம், ஓகே, சாரி, ப்ளீஸ்).
 Never use words like மற்றும், ஏனெனில், எனவே. Use natural interjections (டா, சரி, ஆமா, அய்யோ) only where they fit.
@@ -255,6 +256,14 @@ Only list characters that appear in this clip in "characters"."""
 POLISH_PROMPT = """You are the top dialogue writer for Tamil-dubbed movies and web series (the kind of dub
 people watch on TV/OTT). Rewrite the Tamil of every line below so it sounds like REAL spoken Tamil as people
 talk in Chennai, as in a professional movie dub. NOT written / formal / literary Tamil.
+
+STYLE REFERENCE - this is exactly how the audience talks (a real Tamil speaker's voice messages). Match THIS register:
+  "நான் உங்ககிட்ட பேசுறேன்ல, நான் பேசுறது உனக்கு புரியுதுல்ல"
+  "இப்போ நான் இங்க வந்தா என்ன பண்ணுவேன்"
+  "எனக்கு என்ன பிரச்சனைன்னா, இது சரியா வேலை செய்யல"
+Typical features: -ல / -ல்ல question tags, ன்னு / -னா endings, இங்க/அங்க/எங்க, பண்ணு, -றேன்/-றோம், -ங்க.
+Keep ONE consistent casual register in every sentence. Never mix formal and casual words in the same sentence
+(e.g. do not say "நாங்கள் இங்கு வந்தோம், அவர்தான் வந்தாங்க" -> say "நாங்க இங்க வந்தோம், அவருதான் வந்தாரு").
 
 THINK LIKE THIS: imagine this exact scene happening between real friends / family / colleagues in Chennai.
 How would THIS character say it, in THIS situation, to THIS person? Casual, relaxed, a bit lazy, like talking
@@ -592,6 +601,14 @@ def polish(lines, chars, strict=False):
 
 # Ezhuthu-Tamil -> pechu-Tamil. Gemini sila neram formal-aa ezhudhinaalum idhu pidichu maatthum.
 _COLLOQ = [
+    (r"பேசுவது", "பேசுறது"), (r"செய்வது", "பண்றது"), (r"வருவது", "வர்றது"), (r"போவது", "போறது"), (r"சொல்வது", "சொல்றது"),
+    (r"நாங்கள் இங்கு", "நாங்க இங்க"), (r"அவர்தான்", "அவருதான்"), (r"இவர்தான்", "இவருதான்"), (r"அவள்தான்", "அவதான்"),
+    (r"அவன்தான்", "அவன்தான்"), (r"அவர் தான்", "அவருதான்"), (r"இங்கு தான்", "இங்கதான்"), (r"இங்க தான்", "இங்கதான்"),
+    (r"அங்கு தான்", "அங்கதான்"), (r"நான்தான்", "நான்தான்"), (r"வந்தோம்", "வந்தோம்"), (r"இருக்கிறீர்களா", "இருக்கீங்களா"),
+    (r"புரிகிறதா", "புரியுதா"), (r"புரிந்ததா", "புரிஞ்சுதா"), (r"புரிந்தது", "புரிஞ்சுது"), (r"தெரியுமா", "தெரியுமா"),
+    (r"கொள்ளுங்கள்", "கோங்க"), (r"கொண்டு", "கிட்டு"), (r"விட்டார்கள்", "விட்டாங்க"), (r"விட்டான்", "விட்டான்"),
+    (r"அவர்களுக்கு", "அவங்களுக்கு"), (r"அவர்களை", "அவங்கள"), (r"அவர்களின்", "அவங்களோட"), (r"அவர்களது", "அவங்களோட"),
+    (r"நம்முடைய", "நம்மளோட"), (r"உங்களுடைய", "உங்களோட"), (r"அவனுடைய", "அவனோட"), (r"நம்மை", "நம்மள"),
     (r"ன்\s+என்று(?![\u0B80-\u0BFF])", "ன்னு"), (r"ம்\s+என்று(?![\u0B80-\u0BFF])", "ம்னு"),
     (r"\s+என்று(?![\u0B80-\u0BFF])", "ன்னு"), (r"ஒன்று", "ஒண்ணு"),
     (r"சென்றிரு", "போயிரு"), (r"சென்றுவிட", "போயிட"),
@@ -998,9 +1015,10 @@ STATS = {"tts_failed": 0}
 
 # ------------------- OmniVoice (GPU-la local, limit illaadha Tamil TTS) -------------------
 OMNI_ENABLE = os.environ.get("OMNIVOICE", "1") != "0"        # 0 -> OmniVoice off
-OMNI_REF = os.environ.get("OMNI_REF", "edge")                # edge = Tamil kural reference (Tamil uchcharippu), orig = asal nadigar kural clone
-OMNI_PACE = os.environ.get("OMNI_PACE", "edge")                # edge = Tamil TTS-oda vegam/nadai-ya eduthukkum, speed = OMNI_SPEED, none = model-oda vegam
-OMNI_SPEED = float(os.environ.get("OMNI_SPEED", "1.15"))     # OMNI_PACE=speed na use aagum (1.0 = normal)
+OMNI_REF = os.environ.get("OMNI_REF", "orig")                # edge = Tamil kural reference (Tamil uchcharippu), orig = asal nadigar kural clone
+OMNI_PACE = os.environ.get("OMNI_PACE", "none")                # edge = Tamil TTS-oda vegam/nadai-ya eduthukkum, speed = OMNI_SPEED, none = model-oda vegam
+OMNI_SPEED = float(os.environ.get("OMNI_SPEED", "1.0"))     # OMNI_PACE=speed na use aagum (1.0 = normal)
+OMNI_LANG = os.environ.get("OMNI_LANG", "")                    # "ta" kuduthaa language-a sollum (default: sollaadhu - munnaadi mathiri)
 EDGE_REF_TEXT = "வணக்கம், நான் உங்க கூட கொஞ்சம் பேசணும். இன்னைக்கு என்ன நடந்துச்சுன்னு சொல்லுங்க, நான் கேக்குறேன்."
 OMNI = {"model": None, "refs": {}, "tried": False, "fails": 0, "off_until": 0.0}
 _omni_lock = threading.Lock()
@@ -1092,7 +1110,9 @@ def omni_speak(text, cid, ev=None, emotion="neutral"):
     if not kw and OMNI_PACE != "none" and OMNI_SPEED != 1.0:
         kw["speed"] = OMNI_SPEED
     with _omni_lock:                                         # oru GPU model -> orey nerathula onnu
-        out = m.generate(text=text, language="ta", ref_audio=ref[0], ref_text=ref[1], **kw)
+        if OMNI_LANG:
+            kw["language"] = OMNI_LANG
+        out = m.generate(text=text, ref_audio=ref[0], ref_text=ref[1], **kw)
     a = np.asarray(out[0] if isinstance(out, (list, tuple)) else out, dtype=np.float32).reshape(-1)
     if len(a) < int(0.2 * SR):
         raise RuntimeError("OmniVoice too short")
