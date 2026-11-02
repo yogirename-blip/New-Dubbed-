@@ -924,7 +924,7 @@ def speak(text, voice, system, ev, emotion="neutral", cid=None):
     """OmniVoice -> Gemini -> edge-tts. (ethuvum fail aanaa exception)"""
     if cid is not None and OMNI["model"] is not None:
         try:
-            a = omni_speak(text, cid)
+            a = omni_speak(text, cid, ev, emotion)
             if a is not None:
                 OMNI["fails"] = 0
                 return a
@@ -999,6 +999,8 @@ STATS = {"tts_failed": 0}
 # ------------------- OmniVoice (GPU-la local, limit illaadha Tamil TTS) -------------------
 OMNI_ENABLE = os.environ.get("OMNIVOICE", "1") != "0"        # 0 -> OmniVoice off
 OMNI_REF = os.environ.get("OMNI_REF", "edge")                # edge = Tamil kural reference (Tamil uchcharippu), orig = asal nadigar kural clone
+OMNI_PACE = os.environ.get("OMNI_PACE", "edge")                # edge = Tamil TTS-oda vegam/nadai-ya eduthukkum, speed = OMNI_SPEED, none = model-oda vegam
+OMNI_SPEED = float(os.environ.get("OMNI_SPEED", "1.15"))     # OMNI_PACE=speed na use aagum (1.0 = normal)
 EDGE_REF_TEXT = "வணக்கம், நான் உங்க கூட கொஞ்சம் பேசணும். இன்னைக்கு என்ன நடந்துச்சுன்னு சொல்லுங்க, நான் கேக்குறேன்."
 OMNI = {"model": None, "refs": {}, "tried": False, "fails": 0, "off_until": 0.0}
 _omni_lock = threading.Lock()
@@ -1077,12 +1079,20 @@ def omni_prepare_refs(chars, lines, edge_voices):
     print(f"  OmniVoice reference: {len(OMNI['refs'])}/{len(chars)} characters")
 
 
-def omni_speak(text, cid):
+def omni_speak(text, cid, ev=None, emotion="neutral"):
     m, ref = OMNI["model"], OMNI["refs"].get(cid)
     if m is None or ref is None or time.time() < OMNI["off_until"]:
         return None
+    kw = {}
+    if OMNI_PACE == "edge" and ev is not None:
+        try:                                                 # asal Tamil TTS evvalavu neram pesuthu -> adhey vegam
+            kw["duration"] = round(len(edge_tts_np(text, ev, emotion)) / SR + 0.15, 2)
+        except Exception:  # noqa
+            kw = {}
+    if not kw and OMNI_PACE != "none" and OMNI_SPEED != 1.0:
+        kw["speed"] = OMNI_SPEED
     with _omni_lock:                                         # oru GPU model -> orey nerathula onnu
-        out = m.generate(text=text, language="ta", ref_audio=ref[0], ref_text=ref[1])
+        out = m.generate(text=text, language="ta", ref_audio=ref[0], ref_text=ref[1], **kw)
     a = np.asarray(out[0] if isinstance(out, (list, tuple)) else out, dtype=np.float32).reshape(-1)
     if len(a) < int(0.2 * SR):
         raise RuntimeError("OmniVoice too short")
