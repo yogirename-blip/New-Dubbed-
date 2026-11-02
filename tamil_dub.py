@@ -351,6 +351,19 @@ def trim_silence(x, thr=0.01, pad=int(0.04 * SR)):
     return x[max(0, idx[0] - pad): min(len(x), idx[-1] + pad)]
 
 
+def declick(x):
+    """Vari mudiyumbodhu varra 'krich' sound-ku: kadaisi konjam vettitu fade-in/out."""
+    if len(x) < int(0.2 * SR):
+        return x
+    x = x[: -int(0.015 * SR)]                 # TTS-oda kadaisi artifact
+    x = x - float(np.mean(x[:int(0.01 * SR)]))  # DC offset
+    fi, fo = int(0.012 * SR), int(0.06 * SR)
+    x = x.copy()
+    x[:fi] *= np.linspace(0.0, 1.0, fi, dtype=np.float32)
+    x[-fo:] *= np.linspace(1.0, 0.0, fo, dtype=np.float32)
+    return x
+
+
 def tts_once(text, voice, system, model, use_system=True):
     cfg = dict(
         response_modalities=["AUDIO"],
@@ -453,6 +466,7 @@ def step_tts(script):
                 print(f"  line {i} shorten fail: {str(e)[:100]}")
         if dur > allowed:
             audio = speed_np(audio, min(dur / allowed, MAX_SPEEDUP))
+        audio = declick(audio)
         write_wav(path, audio)
         return i, audio
 
@@ -480,24 +494,37 @@ def step_mix(video, bgm, lines, audios):
         track /= peak
     dub_wav = os.path.join(WORK, "dub_track.wav")
     write_wav(dub_wav, track)
-    fc = (f"[1:a]volume={BGM_VOLUME}[b];[2:a]aresample=44100,volume={VOICE_VOLUME}[d];"
-          f"[b][d]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]")
-    r = sh(f'ffmpeg -y -i "{video}" -i "{bgm}" -i "{dub_wav}" -filter_complex "{fc}" '
-           f'-map 0:v -map "[a]" -c:v copy -c:a aac -b:a 192k -shortest "{OUTPUT_VIDEO}"',
-           check=False)
+    is_mkv = OUTPUT_VIDEO.lower().endswith(".mkv")
+
+    def build(norm):
+        n = ":normalize=0" if norm else ""
+        fc = (f"[1:a]volume={BGM_VOLUME}[b];[2:a]aresample=44100,volume={VOICE_VOLUME}[d];"
+              f"[b][d]amix=inputs=2:duration=first:dropout_transition=0{n}[a]")
+        cmd = (f'ffmpeg -y -i "{video}" -i "{bgm}" -i "{dub_wav}" -filter_complex "{fc}" '
+               f'-map 0:v -map "[a]" ')
+        if is_mkv:
+            # MKV: Tamil dub mudhal track (default) + asal audio rendavadhu track
+            cmd += ('-map 0:a:0? -c:v copy -c:a aac -b:a 192k '
+                    '-metadata:s:a:0 language=tam -metadata:s:a:0 title="Tamil Dub" '
+                    '-metadata:s:a:1 language=und -metadata:s:a:1 title="Original" '
+                    '-disposition:a:0 default -disposition:a:1 0 ')
+        else:
+            cmd += '-c:v copy -c:a aac -b:a 192k -movflags +faststart '
+        return cmd + f'-shortest "{OUTPUT_VIDEO}"'
+
+    r = sh(build(True), check=False)
     if r.returncode != 0:  # pazhaya ffmpeg-la normalize illa
-        fc = fc.replace(":normalize=0", "")
-        sh(f'ffmpeg -y -i "{video}" -i "{bgm}" -i "{dub_wav}" -filter_complex "{fc}" '
-           f'-map 0:v -map "[a]" -c:v copy -c:a aac -b:a 192k -shortest "{OUTPUT_VIDEO}"')
+        sh(build(False))
     print(f"\nMudinjadhu -> {OUTPUT_VIDEO}")
 
 
 # ----------------------------- MAIN -----------------------------------------
-def dub(video, job_dir, progress=print):
+def dub(video, job_dir, progress=print, fmt="mp4"):
     """Oru video-va Tamil-la dub panni output path-a tharum. (Bot idhai kooppidum)"""
     global WORK, OUTPUT_VIDEO
     WORK = os.path.join(job_dir, "work")
-    OUTPUT_VIDEO = os.path.join(job_dir, "dubbed_tamil.mp4")
+    fmt = "mkv" if str(fmt).lower() == "mkv" else "mp4"
+    OUTPUT_VIDEO = os.path.join(job_dir, f"dubbed_tamil.{fmt}")
     os.makedirs(os.path.join(WORK, "tts"), exist_ok=True)
     progress(f"Video: {duration(video)/60:.1f} nimisham. BGM pirikkirom...")
     bgm = step_bgm(video)
