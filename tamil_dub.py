@@ -29,9 +29,9 @@ TEXT_MODEL   = "gemini-3.8-flash"            # video puriyum + Tamil mozhipeyarp
 TTS_MODEL    = "gemini-3.8-flash-tts"        # nalla quality; fail na lite-ku maarum
 TTS_FALLBACK = "gemini-3.8-flash-lite-tts"
 
-CHUNK_MIN    = 8         # video-va ivlo nimisham thundaa pirichu anuppum
+CHUNK_MIN    = 3         # video-va ivlo nimisham thundaa pirichu anuppum
 PROXY_HEIGHT = 480       # Gemini-ku anuppa chinna video (upload vegam)
-MAX_SPEEDUP  = 1.35      # Tamil vari neelamaa irundha max vegappaduthal
+MAX_SPEEDUP  = 1.5       # Tamil vari neelamaa irundha max vegappaduthal
 TTS_WORKERS  = 3         # ore neraththil TTS call (429 vandha 1-aa kuraikkavum)
 BGM_VOLUME   = 0.9
 VOICE_VOLUME = 1.0
@@ -410,14 +410,23 @@ def fill_gaps(proxy, lines, chars, total):
     if not gaps:
         print("  koraivu illa: ellaa pechum cover aachu")
         return lines
+    pieces = []                                   # perisa gap-a 45s thundaa pirikkirom
+    for gs, ge in gaps:
+        a = gs
+        while ge - a > 45:
+            pieces.append((a, a + 45))
+            a += 45
+        pieces.append((a, ge))
+    gaps = pieces
     print(f"  {len(gaps)} idathula pechu miss aachu, marubadi kekkurom...")
     added = 0
     for k, (gs, ge) in enumerate(gaps):
+        check_cancel()
         cs = max(0.0, gs - 0.7)
         ce = min(total, ge + 0.7)
         if ce - cs < 2.5:
             ce = min(total, cs + 2.5)
-        clip = os.path.join(WORK, f"gap_{k}.mp4")
+        clip = os.path.join(WORK, f"gap_{uuid.uuid4().hex[:6]}_{k}.mp4")
         cut_clip(proxy, cs, ce - cs, clip)
         try:
             new = run_clip(clip, cs, chars)
@@ -433,6 +442,64 @@ def fill_gaps(proxy, lines, chars, total):
     lines.sort(key=lambda x: x["start"])
     print(f"  {added} puthu varigal serthom")
     return lines
+
+
+def speech_segments(mask, merge=0.4, min_len=0.25):
+    """Mask-la irundhu 'kural irukkura' (start, end) thundugal."""
+    segs, i, n = [], 0, len(mask)
+    while i < n:
+        if mask[i]:
+            j = i
+            while j < n and mask[j]:
+                j += 1
+            segs.append([i * FRAME, j * FRAME])
+            i = j
+        else:
+            i += 1
+    merged = []
+    for sg in segs:
+        if merged and sg[0] - merged[-1][1] < merge:
+            merged[-1][1] = sg[1]
+        else:
+            merged.append(sg)
+    return [m for m in merged if m[1] - m[0] >= min_len]
+
+
+def snap_lines(lines, segs, window=5.0):
+    """Gemini sollura neram konjam thappa irukkum. Asal kural nijama kekkura idathukku line-a nagarthum
+    (adhaan 'kural oru pakkam, video oru pakkam' prachanai-ku theervu)."""
+    if not segs:
+        return 0
+
+    def speech_ov(a, b):
+        return sum(max(0.0, min(b, e) - max(a, s_)) for s_, e in segs if e > a - 1 and s_ < b + 1)
+
+    moved, prev_end = 0, 0.0
+    for ln in sorted(lines, key=lambda x: x["start"]):
+        a, b = ln["start"], ln["end"]
+        d = max(0.3, b - a)
+        if speech_ov(a, b) >= 0.5 * d:            # already asal pechu mela than irukku
+            prev_end = max(prev_end, ln["end"])
+            continue
+        best, bd = None, None
+        for s_, e in segs:
+            if s_ < a - window:
+                continue
+            if s_ > a + window:
+                break
+            if s_ < prev_end - 0.2:
+                continue
+            if any(o is not ln and s_ - 0.1 <= o["start"] <= s_ + d for o in lines):
+                continue                          # anga vera line already irukku
+            dist = abs(s_ - a)
+            if bd is None or dist < bd:
+                best, bd = s_, dist
+        if best is not None:
+            ln["start"], ln["end"] = round(best, 2), round(best + d, 2)
+            moved += 1
+        prev_end = max(prev_end, ln["end"])
+    lines.sort(key=lambda x: x["start"])
+    return moved
 
 
 def polish(lines, chars):
@@ -484,11 +551,28 @@ def step_script(video):
         clip = os.path.join(WORK, f"chunk_{i}.mp4")
         cut_clip(proxy, off, step, clip)
         print(f"  chunk {i+1}/{n} ({off/60:.0f} min-la irundhu)")
-        lines += run_clip(clip, off, chars)
+        got = None
+        for attempt in range(3):                  # oru chunk fail aanaalum vittuda koodaadhu
+            check_cancel()
+            try:
+                got = run_clip(clip, off, chars)
+                break
+            except Exception as e:  # noqa
+                print(f"  chunk {i+1} fail (try {attempt+1}/3): {str(e)[:150]}")
+                time.sleep(5)
+        lines += got or []
         _P(f"📝 Script எழுதுறேன் (பகுதி {i+1}/{n})", 30 + 20 * (i + 1) / n)
 
     lines.sort(key=lambda x: x["start"])
     lines = fill_gaps(proxy, lines, chars, total)
+    lines = fill_gaps(proxy, lines, chars, total)         # rendavadhu pass: innum miss aana idam irundhaa
+    voc = os.path.join(WORK, "vocals.wav")
+    if os.path.exists(voc):
+        try:
+            n_moved = snap_lines(lines, speech_segments(speech_mask(voc)))
+            print(f"  {n_moved} varigal asal kural neram-ku nagarthappattana")
+        except Exception as e:  # noqa
+            print("  snap fail:", str(e)[:150])
     for sp in {l["speaker"] for l in lines}:
         chars.setdefault(sp, {"id": sp, "gender": "male", "age": "adult",
                               "pitch": "mid", "tone": "neutral"})
