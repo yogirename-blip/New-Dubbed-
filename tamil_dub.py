@@ -470,10 +470,23 @@ def step_mix(video, bgm, lines, audios):
 
 
 # ----------------------------- MAIN -----------------------------------------
-if __name__ == "__main__" or True:
-    video = find_video()
-    print("Video:", video, f"({duration(video)/60:.1f} min)")
+def dub(video, job_dir, progress=print):
+    """Oru video-va Tamil-la dub panni output path-a tharum. (Bot idhai kooppidum)"""
+    global WORK, OUTPUT_VIDEO
+    WORK = os.path.join(job_dir, "work")
+    OUTPUT_VIDEO = os.path.join(job_dir, "dubbed_tamil.mp4")
+    os.makedirs(os.path.join(WORK, "tts"), exist_ok=True)
+    progress(f"Video: {duration(video)/60:.1f} nimisham. BGM pirikkirom...")
     bgm = step_bgm(video)
+    progress("Gemini script eluthuthu (yaar enna pesuranga + pechu Tamil)...")
     script = step_script(video)
+    progress(f"{len(script['lines'])} varigal, {len(script['characters'])} characters. Tamil kural uruvaakkuthu...")
     audios = step_tts(script)
+    progress("Ellathaiyum serkkirom...")
     step_mix(video, bgm, script["lines"], audios)
+    return OUTPUT_VIDEO
+
+
+if __name__ == "__main__":
+    video = find_video()
+    dub(video, OUT_DIR)
