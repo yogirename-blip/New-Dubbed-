@@ -1,0 +1,8 @@
+telethon
+cryptg
+google-genai
+demucs
+edge-tts
+numpy
+soundfile
+omnivoice
