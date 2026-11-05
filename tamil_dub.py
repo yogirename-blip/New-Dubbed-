@@ -1645,6 +1645,17 @@ def dub(video, job_dir, progress=print, fmt="mp4", cancel=None, langs=("ta",)):
         _P("📝 தமிழை பேச்சு நடைக்கு மாத்துறேன்...", 46)
         finish_tamil(script)
     ls = script["lines"]
+    voc_ = os.path.join(WORK, "vocals.wav")
+    if script.get("external") and ls and os.path.exists(voc_):
+        try:                                           # unga script video-vin ethanai sadhaveegatham-a cover pannuthu?
+            segs_ = speech_segments(speech_mask(voc_))
+            gap_ = sum(1 for a_, b_ in segs_ if not any(min(b_, l["end"]) - max(a_, l["start"]) > 0.15 for l in ls))
+            if len(segs_) > 15 and gap_ / len(segs_) > 0.3:
+                progress(f"⚠️ Script-ல {len(ls)} வரிகள் மட்டும்தான் இருக்கு, ஆனா வீடியோவுல சுமார் {len(segs_)} பேச்சு "
+                         f"இடங்கள் இருக்கு. {gap_} இடங்கள்ல அசல் (English) குரல் அப்படியே இருக்கும். "
+                         f"முழு episode script அனுப்பிட்டு மறுபடி முயற்சி பண்ணுங்க.")
+        except Exception as e:  # noqa
+            print("  script coverage check fail:", str(e)[:100])
     span = f" ({ls[0]['start']:.0f}s - {ls[-1]['end']:.0f}s)" if ls else ""
     names = " + ".join(LANGS[l]["native"] for l in langs)
     _P(f"{len(ls)} வரிகள்{span}, {len(script['characters'])} characters. {names} குரல் உருவாக்குறேன்...", 50)
@@ -1664,7 +1675,8 @@ def dub(video, job_dir, progress=print, fmt="mp4", cancel=None, langs=("ta",)):
         mixes.append((lang, mix_language(total, bgm, script["lines"], audios, lang)))
         del audios
         if STATS.get("orig_kept"):
-            progress(f"⚠️ {L['native']}: {STATS['orig_kept']} இடங்களுக்கு dub குரல் கிடைக்கல, அங்க அசல் குரல் இருக்கும்.")
+            progress(f"⚠️ {L['native']}: script-ல இல்லாத {STATS['orig_kept']} பேச்சு இடங்கள்ல அசல் குரல் இருக்கும் "
+                     f"(TTS fail இல்ல - அந்த இடங்களுக்கு dub வசனமே இல்ல).")
     _P("🎬 எல்லாத்தையும் ஒரே வீடியோவில் சேர்க்கிறேன்...", 94)
     mux_all(video, mixes, fmt)
     return OUTPUT_VIDEO
