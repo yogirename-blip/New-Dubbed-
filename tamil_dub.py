@@ -751,7 +751,13 @@ FORMAL_RE = re.compile(r"(கிறே|கிறா|கிறோ|கிறீ|�
 def load_external_script(path):
     """Gemini app-la nee eluthina script (JSON / ```json fence-oda .txt)-a bot-oda format-ku maathum."""
     raw = open(path, encoding="utf-8-sig").read()
-    data = parse_json(raw)
+    try:
+        data = parse_json(raw)
+    except Exception:                              # JSON munnaadi/pinnaadi vera text irundhaa { ... } mattum edukkum
+        a, z = raw.find("{"), raw.rfind("}")
+        if a < 0 or z <= a:
+            raise ValueError("JSON kandupidikka mudiyala")
+        data = json.loads(raw[a:z + 1])
     if isinstance(data, list):
         data = {"lines": data}
     chars_in = data.get("characters") or {}
