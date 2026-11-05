@@ -217,20 +217,35 @@ def find_video():
     raise SystemExit("Video kidaikala. VIDEO_PATH set pannunga.")
 
 
+def gpu_info():
+    """('cuda', 'Tesla T4') GPU irundhaa, illaiyaa ('cpu', 'CPU')."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda", torch.cuda.get_device_name(0)
+    except Exception:  # noqa
+        pass
+    return "cpu", "CPU"
+
+
 # ----------------------------- STEP 1: BGM ----------------------------------
 def step_bgm(video):
     bgm_path = os.path.join(WORK, "bgm.wav")
     if os.path.exists(bgm_path):
         print("[1] BGM cache irukku, skip")
         return bgm_path
-    print("[1] Audio eduthu BGM pirikkirom (CPU-la konjam neram aagum)...")
+    dev, dev_name = gpu_info()
+    tag = "GPU" if dev == "cuda" else "CPU - மெதுவா"
+    print(f"[1] Audio eduthu BGM pirikkirom (device: {dev_name})...")
+    if dev != "cuda":
+        print("  !! GPU illa -> BGM pirikka romba neram aagum. Kaggle Settings-la GPU T4 on pannunga.")
     full = os.path.join(WORK, "full_audio.wav")
     sh(f'ffmpeg -y -i "{video}" -vn -ac 2 -ar 44100 "{full}"')
     check_cancel()
-    _P("🎼 BGM பிரிக்கிறேன்...", 10)
-    r = run_cancellable(f'{sys.executable} -m demucs --two-stems=vocals -n htdemucs '
+    _P(f"🎼 BGM பிரிக்கிறேன் ({tag})...", 10)
+    r = run_cancellable(f'{sys.executable} -m demucs -d {dev} --two-stems=vocals -n htdemucs '
                         f'-o "{WORK}/demucs" "{full}"',
-                        on_pct=lambda x: _P("🎼 BGM பிரிக்கிறேன்...", 10 + x * 0.2))
+                        on_pct=lambda x: _P(f"🎼 BGM பிரிக்கிறேன் ({tag})...", 10 + x * 0.2))
     hits = glob.glob(os.path.join(WORK, "demucs", "**", "no_vocals.wav"), recursive=True)
     if r.returncode == 0 and hits:
         shutil.copy(hits[0], bgm_path)
