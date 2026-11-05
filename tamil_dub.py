@@ -1016,11 +1016,14 @@ def declick(x):
     if len(x) < int(0.2 * SR):
         return x
     x = drop_tail_burst(x)
+    if len(x) < int(0.05 * SR):                 # tail burst vettina piragu romba chinnadhu -> fade vendaam
+        return x
     x = x - float(np.mean(x[:int(0.01 * SR)]))
     pk = float(np.abs(x).max())
     if pk > 1e-4:
         x = x * (0.8 / pk)
     fi, fo = int(0.015 * SR), int(0.09 * SR)
+    fi, fo = min(fi, len(x) // 2), min(fo, len(x) // 2)   # clip-ai vida fade neelamaa irukka koodaadhu
     x = x.copy()
     x[:fi] *= np.linspace(0.0, 1.0, fi, dtype=np.float32)
     x[-fo:] *= np.linspace(1.0, 0.0, fo, dtype=np.float32)
