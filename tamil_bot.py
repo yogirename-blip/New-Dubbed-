@@ -224,22 +224,68 @@ async def settings_cmd(event):
 USER_SCRIPTS = {}   # user_id -> converted script.json path (next video-ku use aagum)
 
 
-async def handle_script_file(event):
-    os.makedirs(os.path.join(BASE, "scripts"), exist_ok=True)
-    raw = os.path.join(BASE, "scripts", f"{event.sender_id}_raw.txt")
+async def ingest_script(event, raw):
+    """raw = script text file. Convert + save + user-ku confirm."""
     out = os.path.join(BASE, "scripts", f"{event.sender_id}.json")
     try:
-        await event.download_media(file=raw)
         data = await asyncio.to_thread(tamil_dub.load_external_script, raw)
         with open(out, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
     except Exception as e:  # noqa
         await event.reply(f"❌ Script படிக்க முடியல: {str(e)[:200]}\n"
-                          "JSON-ல characters, lines (start, end, speaker, tamil) இருக்கணும்.")
+                          "JSON-ல characters, lines (start, end, speaker, tamil) இருக்கணும். "
+                          "Gemini பதிலை முழுசா (கடைசி ]} வரை) copy பண்ணி மறுபடி அனுப்புங்க.")
         return
     USER_SCRIPTS[event.sender_id] = out
     await event.reply(f"✅ Script ரெடி: {len(data['lines'])} வரிகள், {len(data['characters'])} characters.\n"
                       "இப்போ அதே வீடியோவை அனுப்புங்க - script எழுதுற நேரம் மிச்சம்!")
+
+
+async def handle_script_file(event):
+    os.makedirs(os.path.join(BASE, "scripts"), exist_ok=True)
+    raw = os.path.join(BASE, "scripts", f"{event.sender_id}_raw.txt")
+    try:
+        await event.download_media(file=raw)
+    except Exception as e:  # noqa
+        await event.reply(f"❌ File எடுக்க முடியல: {str(e)[:150]}")
+        return
+    await ingest_script(event, raw)
+
+
+SCRIPT_TEXT = {}    # user_id -> [pasted text pieces]  (Gemini-la copy panni nerave paste pannina script)
+
+
+def _is_script_text(e):
+    t = (e.raw_text or "").strip()
+    if e.file is not None or not t or e.sender_id is None:
+        return False
+    if t.startswith("/"):
+        return False
+    return e.sender_id in SCRIPT_TEXT or t.startswith(("{", "[", "```"))
+
+
+@client.on(events.NewMessage(func=_is_script_text))
+async def on_script_text(event):
+    if ALLOWED and event.sender_id not in ALLOWED:
+        return
+    first = event.sender_id not in SCRIPT_TEXT
+    SCRIPT_TEXT.setdefault(event.sender_id, []).append(event.raw_text)
+    if first:
+        await event.reply("📝 Script வாங்கிக்கிட்டேன். இன்னும் பகுதி இருந்தா தொடர்ந்து paste பண்ணுங்க.\n"
+                          "முழுசா அனுப்பினதும் /done அனுப்புங்க.")
+
+
+@client.on(events.NewMessage(pattern=r"^/done"))
+async def on_script_done(event):
+    pieces = SCRIPT_TEXT.pop(event.sender_id, None)
+    if not pieces:
+        await event.reply("Script எதுவும் வரல. Gemini JSON-ஐ copy பண்ணி இங்க paste பண்ணுங்க.")
+        return
+    os.makedirs(os.path.join(BASE, "scripts"), exist_ok=True)
+    raw = os.path.join(BASE, "scripts", f"{event.sender_id}_raw.txt")
+    with open(raw, "w", encoding="utf-8") as f:
+        f.write("".join(pieces))
+    await ingest_script(event, raw)
 
 
 @client.on(events.NewMessage(func=lambda e: e.file is not None))
