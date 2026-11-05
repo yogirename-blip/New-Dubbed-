@@ -748,21 +748,67 @@ FORMAL_RE = re.compile(r"(கிறே|கிறா|கிறோ|கிறீ|�
                        r"எவ்வாறு|தாங்கள்|யாது|ஆகிய|கொண்டிருக்|ிருக்கின்ற|இருந்தார்கள்|சென்ற|கூறி|அவனுடைய|அவளுடைய|இன்று|நேற்று)")
 
 
+def _read_script_text(path):
+    """.txt/.json mattum illa, .docx / .html-layum irundhu text edukkum."""
+    import zipfile, html as _html
+    raw_b = open(path, "rb").read()
+    if raw_b[:2] == b"PK":                                   # .docx (zip)
+        try:
+            xml = zipfile.ZipFile(path).read("word/document.xml").decode("utf-8", "ignore")
+            xml = re.sub(r"</w:p>", "\n", xml)
+            return _html.unescape(re.sub(r"<[^>]+>", "", xml))
+        except Exception:  # noqa
+            pass
+    txt = raw_b.decode("utf-8-sig", "ignore")
+    if re.search(r"<(html|body|script|div)\b", txt[:5000], re.I):   # .html viewer page
+        txt = _html.unescape(re.sub(r"<(script|style)[^>]*>|</(script|style)>", "\n", txt, flags=re.I))
+    return txt
+
+
+def _extract_script_parts(raw):
+    """Pala JSON paguthi (30 nimisha video-ku 5-5 nimisham) / vettupatta JSON-ilum irundhu characters + lines edukkum."""
+    dec = json.JSONDecoder()
+    chars, lines = {}, []
+    i = 0
+    while True:
+        i = raw.find("{", i)
+        if i < 0:
+            break
+        try:
+            obj, end = dec.raw_decode(raw, i)
+        except Exception:
+            i += 1                                           # vettupatta/thappa object -> ullae poi thedu
+            continue
+        if not isinstance(obj, dict):
+            i += 1
+            continue
+        if "lines" in obj or "characters" in obj:
+            cin = obj.get("characters") or {}
+            if isinstance(cin, dict):
+                cin = [dict(v, id=v.get("id", k)) for k, v in cin.items() if isinstance(v, dict)]
+            for c in cin:
+                if isinstance(c, dict) and c.get("id"):
+                    chars.setdefault(str(c["id"]), c)
+            for ln in obj.get("lines") or []:
+                if isinstance(ln, dict):
+                    lines.append(ln)
+            i = end
+        elif "start" in obj and "end" in obj:
+            lines.append(obj)
+            i = end
+        elif "id" in obj and "gender" in obj:
+            chars.setdefault(str(obj["id"]), obj)
+            i = end
+        else:
+            i += 1
+    return chars, lines
+
+
 def load_external_script(path):
-    """Gemini app-la nee eluthina script (JSON / ```json fence-oda .txt)-a bot-oda format-ku maathum."""
-    raw = open(path, encoding="utf-8-sig").read()
-    try:
-        data = parse_json(raw)
-    except Exception:                              # JSON munnaadi/pinnaadi vera text irundhaa { ... } mattum edukkum
-        a, z = raw.find("{"), raw.rfind("}")
-        if a < 0 or z <= a:
-            raise ValueError("JSON kandupidikka mudiyala")
-        data = json.loads(raw[a:z + 1])
-    if isinstance(data, list):
-        data = {"lines": data}
-    chars_in = data.get("characters") or {}
-    if isinstance(chars_in, list):
-        chars_in = {str(c.get("id", f"C{i + 1}")): c for i, c in enumerate(chars_in) if isinstance(c, dict)}
+    """Gemini app-la nee eluthina script (JSON / pala paguthi / .txt / .docx)-a bot-oda format-ku maathum."""
+    raw = _read_script_text(path)
+    chars_in, raw_lines = _extract_script_parts(raw)
+    data = {"lines": raw_lines}
     lines = []
     for ln in data.get("lines") or []:
         try:
@@ -782,6 +828,13 @@ def load_external_script(path):
     if not lines:
         raise ValueError("script-la 'lines' onnum illa (start, end, speaker, tamil venum)")
     lines.sort(key=lambda x: x["start"])
+    seen, uniq = set(), []
+    for l in lines:                                          # rendu paguthi overlap aanaa irukkura dupe varigalai neekkum
+        k = (l["start"], l["end"], l["speaker"])
+        if k not in seen:
+            seen.add(k)
+            uniq.append(l)
+    lines = uniq
     chars = {}
     for sp in {l["speaker"] for l in lines}:
         c = dict(chars_in.get(sp, {}))
