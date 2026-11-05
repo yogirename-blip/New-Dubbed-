@@ -997,6 +997,31 @@ def step_script(video):
                 print("  external snap fail:", str(e)[:150])
             cached["snapped"] = True
             json.dump(cached, open(script_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        if cached.get("external") and not cached.get("gaps_filled") and os.path.exists(voc_):
+            try:                                   # unga script-la illatha pechu idangalai Gemini-ae Tamil-la eluthi nirappum
+                _P("🧩 Script-ல இல்லாத இடங்களை Gemini தமிழ்ல எழுதுது...", 35)
+                proxy = make_proxy(video)
+                total = duration(proxy)
+                n0 = len(cached["lines"])
+                chars_ = cached.setdefault("characters", {})
+                lines_ = fill_gaps(proxy, cached["lines"], chars_, total)
+                lines_ = fill_gaps(proxy, lines_, chars_, total)
+                try:
+                    snap_lines(lines_, speech_segments(speech_mask(voc_)))
+                except Exception as e:  # noqa
+                    print("  gap snap fail:", str(e)[:100])
+                lines_.sort(key=lambda x: x["start"])
+                cached["lines"] = lines_
+                for sp in {l["speaker"] for l in lines_}:
+                    chars_.setdefault(sp, {"id": sp, "gender": "male", "age": "adult", "pitch": "mid",
+                                           "tone": "neutral", "look": ""})
+                print(f"  external script: Gemini {len(lines_) - n0} puthu varigal serthathu")
+                cached["gaps_filled"] = True
+            except Cancelled:
+                raise
+            except Exception as e:  # noqa
+                print("  external gap fill fail:", str(e)[:150])
+            json.dump(cached, open(script_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
         return cached
 
     print("[2] Gemini-ku video anuppi script eluthurom...")
