@@ -828,10 +828,115 @@ def _extract_script_parts(raw):
     return chars, lines
 
 
+def _md_emotion(direction):
+    d = direction or ""
+    for emo, keys in (("shout", ("கூச்சல்", "கத்தி", "கத்த", "அலறல்")),
+                      ("scared", ("பயம்", "நடுக்க", "மிரண்டு")),
+                      ("angry", ("ஆவேச", "கோபம்", "கோபத்", "மிரட்டல்", "முறைப்பு", "கடுப்பு", "எரிச்சல்", "ஆத்திரம்")),
+                      ("whisper", ("முணுமுணுப்பு", "கிசுகிசு", "மெல்லிய குரல்")),
+                      ("sad", ("சோக", "வருத்த", "அழுகை", "கலக்கம்", "நெகிழ்ச்சி", "கண்ணீர்")),
+                      ("happy", ("சிரிப்பு", "மகிழ்ச்சி", "உற்சாக", "சந்தோஷ")),
+                      ("calm", ("நிதானம்", "அமைதி", "கம்பீரம்", "பவ்ய"))):
+        if any(k in d for k in keys):
+            return emo
+    return "neutral"
+
+
+def _md_char_traits(row_text):
+    t = row_text
+    gender = "female" if any(k in t for k in ("பெண்", "தங்கை", "அக்கா", "அம்மா", "பாட்டி")) else "male"
+    age = "adult"
+    if any(k in t for k in ("முதியவர்", "பெரியவர்", "தாத்தா")):
+        age = "elder"
+    elif any(k in t for k in ("இளம்", "இளைஞன்", "சுட்டி")):
+        age = "young"
+    elif any(k in t for k in ("சிறுவன்", "சிறுமி", "குழந்தை")):
+        age = "child"
+    pitch = "mid"
+    if any(k in t for k in ("ஆழமான", "கனத்த", "பேஸ்", "கரகர")):
+        pitch = "low"
+    elif any(k in t for k in ("மெல்லிய", "சுட்டி", "கீச்")):
+        pitch = "high"
+    return gender, age, pitch
+
+
+def _parse_markdown_script(raw):
+    """Gemini-yin 'MM:SS - MM:SS | C3 (Klein) [emotion]: "vasanam"' vadivam (.md/.docx/.txt) -> characters + lines."""
+    chars, lines = {}, []
+    hdr = re.compile(r"^(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*[–—\-]+\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*\|\s*(.*)$")
+    quotes = "\"“”„‟«»"
+    scene_title, scene_desc = "", ""
+    cur = None
+
+    def flush():
+        nonlocal cur
+        if cur and cur["tamil"].strip():
+            lines.append(cur)
+        cur = None
+
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.count("|") >= 3:         # character table row
+            cells = [c.strip().replace("*", "") for c in stripped.strip("|").split("|")]
+            m = re.search(r"\bC\d+\b", cells[0]) if cells else None
+            if m and len(cells) >= 2:
+                cid = m.group(0)
+                row = " ".join(cells[1:])
+                g, a, pch = _md_char_traits(row)
+                chars[cid] = {"id": cid, "gender": g, "age": a, "pitch": pch,
+                              "tone": " / ".join(c for c in cells[2:] if c)[:120] or cells[1], "look": cells[1]}
+            continue
+        clean = re.sub(r"^[\s>*\-•]+", "", stripped).replace("**", "").strip()
+        m = hdr.match(clean)
+        if m:
+            flush()
+            rest = m.group(3)
+            qpos = [rest.find(q) for q in quotes if rest.find(q) >= 0]
+            text = ""
+            if qpos:
+                k = min(qpos)
+                rest, text = rest[:k], rest[k:]
+            spk = re.search(r"\bC\d+\b", rest)
+            if not spk:
+                cur = None
+                continue
+            dm = re.findall(r"\[([^\]]*)\]", rest)
+            direction = " ".join(dm)
+            nm = re.search(r"\(([^)]*)\)", rest)
+            cur = {"start": m.group(1), "end": m.group(2), "speaker": spk.group(0),
+                   "tamil": text.strip(quotes + " :"), "emotion": _md_emotion(direction),
+                   "scene": " | ".join(x for x in (scene_title, scene_desc, direction) if x)[:300]}
+            if nm and spk.group(0) not in chars:
+                chars[spk.group(0)] = {"id": spk.group(0), "gender": "male", "age": "adult", "pitch": "mid",
+                                       "tone": nm.group(1), "look": nm.group(1)}
+            continue
+        if not clean or clean.startswith("---") or clean.startswith("#"):
+            if clean.startswith("#"):
+                flush()
+                scene_title, scene_desc = clean.lstrip("# ").strip(), ""
+            elif not clean:
+                flush()
+            continue
+        mm = re.match(r"^\(?\s*காட்சி\s*:\s*(.*?)\)?$", clean)
+        if mm:
+            flush()
+            scene_desc = mm.group(1)
+            continue
+        if cur is not None:                                              # vasanam adutha varigalil thodarndhaal
+            cur["tamil"] = (cur["tamil"] + " " + clean.strip(quotes + " ")).strip()
+    flush()
+    return chars, lines
+
+
 def load_external_script(path):
     """Gemini app-la nee eluthina script (JSON / pala paguthi / .txt / .docx)-a bot-oda format-ku maathum."""
     raw = _read_script_text(path)
     chars_in, raw_lines = _extract_script_parts(raw)
+    md_mode = False
+    if not raw_lines:                                  # JSON illa -> 'MM:SS - MM:SS | C1 (..) [..]: "..."' vadivam-a try pannum
+        md_chars, md_lines = _parse_markdown_script(raw)
+        if md_lines:
+            chars_in, raw_lines, md_mode = md_chars, md_lines, True
     data = {"lines": raw_lines}
     lines = []
     for ln in data.get("lines") or []:
@@ -865,7 +970,10 @@ def load_external_script(path):
         chars[sp] = {"id": sp, "gender": c.get("gender", "male"), "age": c.get("age", "adult"),
                      "pitch": c.get("pitch", "mid"), "tone": c.get("tone", "neutral"),
                      "look": c.get("look", "")}
-    return {"characters": chars, "lines": lines, "tamil_done": False, "external": True}
+    if md_mode:                                        # script-la Tamil already per-character slang-la irukku -> thirumba maatha vendaam
+        for l in lines:
+            l["original"] = l["tamil"]
+    return {"characters": chars, "lines": lines, "tamil_done": md_mode, "external": True}
 
 
 def step_script(video):
