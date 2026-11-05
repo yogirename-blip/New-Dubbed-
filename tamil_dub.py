@@ -910,6 +910,13 @@ def _parse_markdown_script(raw):
                 chars[spk.group(0)] = {"id": spk.group(0), "gender": "male", "age": "adult", "pitch": "mid",
                                        "tone": nm.group(1), "look": nm.group(1)}
             continue
+        rm = re.match(r"^(?:\d+[.)]\s*)?(C\d+)\s*[-–—]\s*(.*?)\s*:\s*(.*)$", clean)   # "1. **C0 - Narrator:** kural vivaram"
+        if rm and cur is None:
+            cid, nm_, desc_ = rm.group(1), rm.group(2).strip(), rm.group(3).strip()
+            g, a, pch = _md_char_traits(nm_ + " " + desc_)
+            chars[cid] = {"id": cid, "gender": g, "age": a, "pitch": pch,
+                          "tone": (desc_ or nm_)[:120], "look": nm_}
+            continue
         if not clean or clean.startswith("---") or clean.startswith("#"):
             if clean.startswith("#"):
                 flush()
