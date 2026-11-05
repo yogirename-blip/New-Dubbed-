@@ -294,11 +294,11 @@ async def on_file(event):
         await event.reply("மன்னிக்கவும், இந்த bot உங்களுக்கு அனுமதி இல்லை.")
         return
     fname = (getattr(event.file, "name", None) or "").lower()
-    if not is_video(event.message) and fname.endswith((".json", ".txt")):
+    if not is_video(event.message) and fname.endswith((".json", ".txt", ".docx", ".html", ".htm", ".md")):
         await handle_script_file(event)                  # Gemini app-la eluthina script-a vaanguvom
         return
     if not is_video(event.message):
-        await event.reply("வீடியோ file மட்டும் அனுப்புங்க. (Script இருந்தா .json / .txt ஆ அனுப்பலாம்)")
+        await event.reply("வீடியோ file மட்டும் அனுப்புங்க. (Script இருந்தா .txt / .json / .docx ஆ அனுப்பலாம்)")
         return
     remember_user(event.chat_id)
     for k in [k for k, v in PENDING.items() if time.time() - v["ts"] > 3600]:
