@@ -601,6 +601,7 @@ async def main():
     await client.start(bot_token=BOT_TOKEN)
     me = await client.get_me()
     print(f"Bot ready: @{me.username}  (Telegram-la poi /start anuppunga)")
+    print("Device:", tamil_dub.gpu_info()[1], "(GPU illa na BGM romba mella aagum)")
 
     # --- mundhaiya run thideernu nindru pochaa? ---
     if prev and not prev.get("clean"):
