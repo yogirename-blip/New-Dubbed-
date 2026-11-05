@@ -288,6 +288,56 @@ async def on_script_done(event):
     await ingest_script(event, raw)
 
 
+SMALL_SEC = 300      # /small -> ovvoru paguthi 5 nimisham
+
+
+def _make_small_parts(src, outdir):
+    """Gemini app-ku (100MB limit) romba chinna 360p paguthigal. Ovvoru 5 nimisham ~10-12MB."""
+    shutil.rmtree(outdir, ignore_errors=True)
+    os.makedirs(outdir, exist_ok=True)
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", src, "-map", "0:v:0", "-map", "0:a:0?",
+           "-vf", "scale=-2:360,fps=10", "-c:v", "libx264", "-preset", "veryfast", "-crf", "34",
+           "-maxrate", "250k", "-bufsize", "500k",
+           "-force_key_frames", f"expr:gte(t,n_forced*{SMALL_SEC})",
+           "-c:a", "aac", "-b:a", "40k", "-ac", "1",
+           "-f", "segment", "-segment_time", str(SMALL_SEC), "-reset_timestamps", "1",
+           "-segment_format", "mp4", os.path.join(outdir, "part_%02d.mp4")]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr[-300:])
+    return sorted(f for f in os.listdir(outdir) if f.endswith(".mp4"))
+
+
+@client.on(events.NewMessage(pattern=r"^/small"))
+async def on_small(event):
+    if ALLOWED and event.sender_id not in ALLOWED:
+        return
+    rep = await event.get_reply_message()
+    if not rep or not is_video(rep):
+        await event.reply("பெரிய வீடியோவுக்கு reply பண்ணி /small அனுப்புங்க. "
+                          "Gemini app-ல போடுற மாதிரி சின்ன 5 நிமிஷ பகுதிகளா பிரிச்சு தரேன்.")
+        return
+    work = os.path.join(BASE, f"small_{event.sender_id}")
+    os.makedirs(work, exist_ok=True)
+    st = await event.reply("⬇️ பதிவிறக்குறேன்...")
+    try:
+        src = await rep.download_media(file=os.path.join(work, "in"))
+        await st.edit("✂️ சின்ன பகுதிகளா பிரிக்கிறேன் (நேரம் ஆகும்)...")
+        outdir = os.path.join(work, "parts")
+        parts = await asyncio.to_thread(_make_small_parts, src, outdir)
+        for n, name in enumerate(parts):
+            start = n * SMALL_SEC
+            await client.send_file(event.chat_id, os.path.join(outdir, name), force_document=True,
+                                   caption=(f"பகுதி {n + 1}/{len(parts)}\n"
+                                            f"Gemini prompt-ல part_start = {start} ன்னு போடுங்க "
+                                            f"({start // 60}:{start % 60:02d} ல இருந்து)"))
+        await st.edit(f"✅ {len(parts)} பகுதிகள் அனுப்பிட்டேன். ஒவ்வொண்ணா Gemini-ல போடுங்க.")
+    except Exception as e:  # noqa
+        await st.edit(f"❌ முடியல: {str(e)[:200]}")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 @client.on(events.NewMessage(func=lambda e: e.file is not None))
 async def on_file(event):
     if ALLOWED and event.sender_id not in ALLOWED:
