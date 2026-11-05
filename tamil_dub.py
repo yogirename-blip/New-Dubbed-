@@ -283,6 +283,7 @@ Return ONLY JSON:
 {{
  "characters": [ {{"id":"C1","gender":"male|female","age":"child|young|adult|elder",
                    "pitch":"low|mid|high","tone":"short English description of voice/personality",
+                   "look":"short English note: face/hair/clothes/role so the same person is recognised in later clips",
                    "is_new": true}} ],
  "lines": [ {{"start":"00:01.2","end":"00:03.9","speaker":"C1",
               "original":"original words","english":"short natural English meaning","tamil":"colloquial Tamil",
@@ -406,8 +407,10 @@ def run_clip(clip, off, chars):
     f = upload_wait(clip)
     roster = ""
     if chars:
-        roster = ("Characters already known from earlier clips (reuse these IDs for the same people, "
-                  "only create a NEW id for a truly new person):\n" +
+        roster = ("Characters already known from earlier clips. The SAME person must ALWAYS keep the SAME id. "
+                  "Match by face, clothes/look, voice and role (use each character's 'look' note). The main hero and "
+                  "recurring characters must never get a second id. Create a NEW id ONLY for a person who clearly "
+                  "has never appeared before; when unsure, reuse the closest existing id:\n" +
                   json.dumps(chars, ensure_ascii=False))
     prompt = SCRIPT_PROMPT.format(roster=roster)
     resp = gen([f, prompt],
@@ -1116,17 +1119,20 @@ def edge_tts_np(text, ev, emotion="neutral"):
 def speak(text, voice, system, ev, emotion="neutral", cid=None, lang="ta"):
     """OmniVoice -> Gemini -> edge-tts. (ethuvum fail aanaa exception)"""
     if cid is not None and OMNI["model"] is not None:
-        try:
-            a = omni_speak(text, cid, ev, emotion, lang)
-            if a is not None:
-                OMNI["fails"] = 0
-                return a
-        except Exception as e:  # noqa
-            OMNI["fails"] += 1
-            print(f"  OmniVoice fail ({OMNI['fails']}): {str(e)[:100]}")
-            if OMNI["fails"] >= 5:
-                OMNI["off_until"] = time.time() + 300
-                OMNI["fails"] = 0
+        for _try in range(3):                      # same character voice-ae irukka: 3 thadavai try pannum
+            try:
+                a = omni_speak(text, cid, ev, emotion, lang)
+                if a is not None:
+                    OMNI["fails"] = 0
+                    return a
+                break
+            except Exception as e:  # noqa
+                OMNI["fails"] += 1
+                print(f"  OmniVoice fail ({OMNI['fails']}): {str(e)[:100]}")
+                time.sleep(0.5)
+        if OMNI["fails"] >= 30:                    # romba fail aanaa mattum konja neram off (voice maaruvathai thavirkka)
+            OMNI["off_until"] = time.time() + 60
+            OMNI["fails"] = 0
     if time.time() >= _state_tts["dead_until"]:
         try:
             a = tts(text, voice, system)
@@ -1252,16 +1258,16 @@ def omni_prepare_refs(chars, lines, edge_voices, lang="ta"):
                 if ln.get("speaker") != cid or not ln.get("original"):
                     continue
                 d = ln["end"] - ln["start"]
-                if not 3.0 <= d <= 10.0:
+                if not 2.0 <= d <= 14.0:
                     continue
                 a, b = int(ln["start"] / FRAME), int(ln["end"] / FRAME)
                 frac = float(mask[a:b].mean()) if b > a else 0.0
                 score = frac * min(d, 8.0)
-                if frac >= 0.6 and score > bscore:
+                if frac >= 0.5 and score > bscore:
                     best, bscore = ln, score
             if best is not None:
                 r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{best['start']:.2f}",
-                                    "-t", f"{best['end'] - best['start']:.2f}", "-i", voc,
+                                    "-t", f"{min(best['end'] - best['start'], 10.0):.2f}", "-i", voc,
                                     "-ac", "1", "-ar", str(SR), path], capture_output=True)
                 if r.returncode == 0 and os.path.exists(path):
                     got = (path, best["original"])
@@ -1275,7 +1281,9 @@ def omni_prepare_refs(chars, lines, edge_voices, lang="ta"):
                 print(f"  ref {cid} fail: {str(e)[:100]}")
         if got:
             OMNI["refs"][cid] = got
-    print(f"  OmniVoice reference: {len(OMNI['refs'])}/{len(chars)} characters")
+    n_orig = sum(1 for v in OMNI["refs"].values() if not os.path.basename(v[0]).startswith("ref_" + lang + "_"))
+    print(f"  OmniVoice reference: {len(OMNI['refs'])}/{len(chars)} characters ({n_orig} asal kural clone, "
+          f"{len(OMNI['refs']) - n_orig} edge-tts reference)")
 
 
 def omni_speak(text, cid, ev=None, emotion="neutral", lang="ta"):
@@ -1293,6 +1301,11 @@ def omni_speak(text, cid, ev=None, emotion="neutral", lang="ta"):
     with _omni_lock:                                         # oru GPU model -> orey nerathula onnu
         if OMNI_LANG:
             kw["language"] = LANGS[lang]["code"] if OMNI_LANG.lower() in ("auto", "1", "on", "yes") else OMNI_LANG
+        try:                                                 # oru character-ku oru seed -> ellaa varigalilum orey kural
+            import torch
+            torch.manual_seed(sum(ord(ch) for ch in str(cid)) * 7919 % 2**31)
+        except Exception:  # noqa
+            pass
         out = m.generate(text=text, ref_audio=ref[0], ref_text=ref[1], **kw)
     a = np.asarray(out[0] if isinstance(out, (list, tuple)) else out, dtype=np.float32).reshape(-1)
     if len(a) < int(0.2 * SR):
