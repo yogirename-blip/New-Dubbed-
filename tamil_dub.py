@@ -748,11 +748,58 @@ FORMAL_RE = re.compile(r"(கிறே|கிறா|கிறோ|கிறீ|�
                        r"எவ்வாறு|தாங்கள்|யாது|ஆகிய|கொண்டிருக்|ிருக்கின்ற|இருந்தார்கள்|சென்ற|கூறி|அவனுடைய|அவளுடைய|இன்று|நேற்று)")
 
 
+def load_external_script(path):
+    """Gemini app-la nee eluthina script (JSON / ```json fence-oda .txt)-a bot-oda format-ku maathum."""
+    raw = open(path, encoding="utf-8-sig").read()
+    data = parse_json(raw)
+    if isinstance(data, list):
+        data = {"lines": data}
+    chars_in = data.get("characters") or {}
+    if isinstance(chars_in, list):
+        chars_in = {str(c.get("id", f"C{i + 1}")): c for i, c in enumerate(chars_in) if isinstance(c, dict)}
+    lines = []
+    for ln in data.get("lines") or []:
+        try:
+            st, en = ts_to_sec(ln["start"]), ts_to_sec(ln["end"])
+        except Exception:
+            continue
+        tamil = str(ln.get("tamil", "")).strip()
+        if en <= st or not tamil:
+            continue
+        lines.append({"start": round(st, 2), "end": round(en, 2),
+                      "speaker": str(ln.get("speaker", "C1")),
+                      "original": str(ln.get("original", "")),
+                      "english": str(ln.get("english", "")),
+                      "tamil": tamil,
+                      "to": str(ln.get("to", "")), "scene": str(ln.get("scene", "")),
+                      "emotion": str(ln.get("emotion", "neutral")) or "neutral"})
+    if not lines:
+        raise ValueError("script-la 'lines' onnum illa (start, end, speaker, tamil venum)")
+    lines.sort(key=lambda x: x["start"])
+    chars = {}
+    for sp in {l["speaker"] for l in lines}:
+        c = dict(chars_in.get(sp, {}))
+        chars[sp] = {"id": sp, "gender": c.get("gender", "male"), "age": c.get("age", "adult"),
+                     "pitch": c.get("pitch", "mid"), "tone": c.get("tone", "neutral"),
+                     "look": c.get("look", "")}
+    return {"characters": chars, "lines": lines, "tamil_done": False, "external": True}
+
+
 def step_script(video):
     script_path = os.path.join(WORK, "script.json")
     if os.path.exists(script_path):
         print("[2] script.json cache irukku, skip")
-        return json.load(open(script_path, encoding="utf-8"))
+        cached = json.load(open(script_path, encoding="utf-8"))
+        voc_ = os.path.join(WORK, "vocals.wav")
+        if cached.get("external") and not cached.get("snapped") and os.path.exists(voc_):
+            try:                                   # unga script-oda neram-a asal kural neram-ku othukkum
+                n_moved = snap_lines(cached["lines"], speech_segments(speech_mask(voc_)))
+                print(f"  external script: {n_moved} varigal asal kural neram-ku nagarthappattana")
+            except Exception as e:  # noqa
+                print("  external snap fail:", str(e)[:150])
+            cached["snapped"] = True
+            json.dump(cached, open(script_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        return cached
 
     print("[2] Gemini-ku video anuppi script eluthurom...")
     proxy = make_proxy(video)
