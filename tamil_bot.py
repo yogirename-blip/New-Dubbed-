@@ -221,13 +221,38 @@ async def settings_cmd(event):
                       "\n\nஒவ்வொரு வீடியோ அனுப்பும்போதும் பட்டன்ல மாத்திக்கலாம்.")
 
 
+USER_SCRIPTS = {}   # user_id -> converted script.json path (next video-ku use aagum)
+
+
+async def handle_script_file(event):
+    os.makedirs(os.path.join(BASE, "scripts"), exist_ok=True)
+    raw = os.path.join(BASE, "scripts", f"{event.sender_id}_raw.txt")
+    out = os.path.join(BASE, "scripts", f"{event.sender_id}.json")
+    try:
+        await event.download_media(file=raw)
+        data = await asyncio.to_thread(tamil_dub.load_external_script, raw)
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+    except Exception as e:  # noqa
+        await event.reply(f"❌ Script படிக்க முடியல: {str(e)[:200]}\n"
+                          "JSON-ல characters, lines (start, end, speaker, tamil) இருக்கணும்.")
+        return
+    USER_SCRIPTS[event.sender_id] = out
+    await event.reply(f"✅ Script ரெடி: {len(data['lines'])} வரிகள், {len(data['characters'])} characters.\n"
+                      "இப்போ அதே வீடியோவை அனுப்புங்க - script எழுதுற நேரம் மிச்சம்!")
+
+
 @client.on(events.NewMessage(func=lambda e: e.file is not None))
 async def on_file(event):
     if ALLOWED and event.sender_id not in ALLOWED:
         await event.reply("மன்னிக்கவும், இந்த bot உங்களுக்கு அனுமதி இல்லை.")
         return
+    fname = (getattr(event.file, "name", None) or "").lower()
+    if not is_video(event.message) and fname.endswith((".json", ".txt")):
+        await handle_script_file(event)                  # Gemini app-la eluthina script-a vaanguvom
+        return
     if not is_video(event.message):
-        await event.reply("வீடியோ file மட்டும் அனுப்புங்க.")
+        await event.reply("வீடியோ file மட்டும் அனுப்புங்க. (Script இருந்தா .json / .txt ஆ அனுப்பலாம்)")
         return
     remember_user(event.chat_id)
     for k in [k for k, v in PENDING.items() if time.time() - v["ts"] > 3600]:
@@ -386,6 +411,10 @@ async def worker():
         key = getattr(doc, "id", None) or int(time.time())
         folder = os.path.join(BASE, f"{job.user_id}_{key}")
         os.makedirs(folder, exist_ok=True)
+        ext = USER_SCRIPTS.pop(job.user_id, None)           # user script anuppiyirundhaa adhaiye use pannum
+        if ext and os.path.exists(ext):
+            os.makedirs(os.path.join(folder, "work"), exist_ok=True)
+            shutil.copy(ext, os.path.join(folder, "work", "script.json"))
         keep_folder = False
         stop = asyncio.Event()
         tick = asyncio.create_task(ticker(job, stop))
