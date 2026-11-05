@@ -264,6 +264,14 @@ Never use words like மற்றும், ஏனெனில், எனவே.
 Write in Tamil script. Common loanwords are fine (ஓகே, சாரி, போன்). No Hindi/English sentences.
 Keep meaning, emotion and length close to the original so it fits the same time. Short, speakable sentences.
 
+SCENE-AWARE DUBBING (VERY IMPORTANT): do NOT translate word by word. First understand the situation on screen:
+where they are, what just happened, who is talking to whom (friend, kid, parent, boss, enemy, stranger), and the mood.
+Then write what a real Tamil person would SAY in that exact situation, even if the wording is different from the original.
+If the original is a formal or bookish sentence, say the same thing the way people actually speak. Prefer short natural
+phrases, fillers and reactions (ஆமா, சரி, என்னடா, அட, ஹ்ம்ம், ச்சே, அய்யோ) over full textbook sentences.
+Match respect level to the relationship: friends/younger use நீ/டா/டி, elders/strangers/boss use நீங்க/சார்/அண்ணா/அக்கா.
+Read every line aloud in your head; if it sounds like reading from a book or a news bulletin, rewrite it.
+
 Speakers: use the video (who is on screen, who is speaking) and the voices to decide who speaks.
 Use stable IDs like C1, C2, C3. The same person must ALWAYS get the same ID.
 {roster}
@@ -278,6 +286,8 @@ Return ONLY JSON:
                    "is_new": true}} ],
  "lines": [ {{"start":"00:01.2","end":"00:03.9","speaker":"C1",
               "original":"original words","english":"short natural English meaning","tamil":"colloquial Tamil",
+              "to":"who they are talking to and relation, e.g. 'C2 (best friend)' or 'child' or 'boss'",
+              "scene":"very short English note: what is happening in this moment",
               "emotion":"neutral|angry|sad|happy|scared|whisper|shout|calm"}} ]
 }}
 Only list characters that appear in this clip in "characters"."""
@@ -300,6 +310,17 @@ on Pogo, Netflix or Amazon): lively Chennai street-casual Tamil, short punchy li
 Friends say டா/டி, வாடா, போடா, மச்சி; juniors say அண்ணா/அக்கா/சார்; fights and shouts stay short and loud
 ("டேய்! என்ன பண்ற நீ?", "நான் உன்ன காப்பாத்துவேன், கண்டிப்பா!", "அது முடியாது, நிறுத்து!").
 Never sound like a textbook, a news reader or a speech. If a line has both a formal word and a casual word, rewrite the whole line casual.
+
+MOST IMPORTANT: use the scene info. Each item has "scene" (what is happening), "to" (who is being spoken to) and
+prev2/prev/next/next2 (neighbouring lines). Do NOT translate the English literally. Ask: in THIS situation, what would a real
+Tamil person blurt out? Rewrite so it flows like a real conversation with the previous and next line (answers, reactions,
+"ஆமா", "இல்ல", "ஹே", "ச்சே"), not like separate sentences read from a script. Drop stiff phrases and use the short everyday way.
+Bookish -> spoken examples:
+  "நீங்கள் என்ன சொல்ல விரும்புகிறீர்கள்?" -> "என்ன சொல்ல வர்றீங்க?"
+  "நான் அதைப் பற்றி யோசித்துக் கொண்டிருக்கிறேன்" -> "அதான் யோசிச்சிட்டு இருக்கேன்"
+  "எனக்கு உன்னுடைய உதவி தேவைப்படுகிறது" -> "எனக்கு உன் உதவி வேணும்"
+  "இது எப்படி சாத்தியம்?" -> "இது எப்படி முடியும்?"
+  "அவசியம் இல்லை" -> "அதெல்லாம் வேணாம்"
 
 THINK LIKE THIS: imagine this exact scene happening between real friends / family / colleagues in Chennai.
 How would THIS character say it, in THIS situation, to THIS person? Casual, relaxed, a bit lazy, like talking
@@ -391,7 +412,7 @@ def run_clip(clip, off, chars):
     prompt = SCRIPT_PROMPT.format(roster=roster)
     resp = gen([f, prompt],
                types.GenerateContentConfig(response_mime_type="application/json",
-                                           temperature=0.4), what="script")
+                                           temperature=0.6), what="script")
     try:
         client.files.delete(name=f.name)
     except Exception:
@@ -413,6 +434,8 @@ def run_clip(clip, off, chars):
                     "original": ln.get("original", ""),
                     "english": ln.get("english", ""),
                     "tamil": ln["tamil"].strip(),
+                    "to": ln.get("to", ""),
+                    "scene": ln.get("scene", ""),
                     "emotion": ln.get("emotion", "neutral")})
     return out
 
@@ -615,9 +638,13 @@ def polish(lines, chars, strict=False):
             n_ = pos.get(id(ln), 0)
             prev_ = lines[n_ - 1]["tamil"] if n_ > 0 else ""
             next_ = lines[n_ + 1]["tamil"] if n_ + 1 < len(lines) else ""
+            prev2_ = lines[n_ - 2]["tamil"] if n_ > 1 else ""
+            next2_ = lines[n_ + 2]["tamil"] if n_ + 2 < len(lines) else ""
             items.append({"id": k, "who": f"{c.get('age','adult')} {c.get('gender','male')} ({c.get('tone','')})",
                           "emotion": ln.get("emotion", "neutral"),
-                          "en": ln.get("original", ""), "ta": ln["tamil"], "prev": prev_, "next": next_})
+                          "scene": ln.get("scene", ""), "to": ln.get("to", ""),
+                          "en": ln.get("english", "") or ln.get("original", ""), "ta": ln["tamil"],
+                          "prev2": prev2_, "prev": prev_, "next": next_, "next2": next2_})
         prompt = POLISH_PROMPT.format(items=json.dumps(items, ensure_ascii=False))
         if strict:
             prompt = ("IMPORTANT: these lines are STILL too formal / bookish. Throw the old Tamil away and write each "
@@ -625,7 +652,7 @@ def polish(lines, chars, strict=False):
                       + prompt)
         try:
             resp = gen(prompt, types.GenerateContentConfig(
-                response_mime_type="application/json", temperature=0.5), what="polish")
+                response_mime_type="application/json", temperature=0.7), what="polish")
             data = parse_json(resp.text)
             for it in data.get("lines", []):
                 k = int(it["id"])
@@ -941,6 +968,8 @@ def style_text(c, emotion, lang="ta"):
             f"Voice character: {c.get('tone','natural')}. Current emotion: {emotion}. "
             f"Speak casual, everyday spoken {nm} exactly as written, with a relaxed conversational rhythm "
             f"and real acting emotion, like dialogue in a {nm} film. Not like a news reader and not formal. "
+            f"Do NOT read it like a text: talk it naturally, with natural pauses, quick casual pacing, "
+            f"stress on the emotional words, and slightly lazy everyday pronunciation, as if chatting with a friend. "
             f"Read only the user's text, never read these instructions.")
 
 
