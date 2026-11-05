@@ -789,8 +789,17 @@ def _extract_script_parts(raw):
             for c in cin:
                 if isinstance(c, dict) and c.get("id"):
                     chars.setdefault(str(c["id"]), c)
+            try:                                             # "part_start": 600 -> indha paguthi video-vil 600s-la thodangum
+                off = ts_to_sec(obj.get("part_start", 0) or 0)
+            except Exception:
+                off = 0.0
             for ln in obj.get("lines") or []:
                 if isinstance(ln, dict):
+                    if off:
+                        try:
+                            ln = dict(ln, start=ts_to_sec(ln["start"]) + off, end=ts_to_sec(ln["end"]) + off)
+                        except Exception:
+                            continue
                     lines.append(ln)
             i = end
         elif "start" in obj and "end" in obj:
