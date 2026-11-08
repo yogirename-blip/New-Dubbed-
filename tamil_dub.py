@@ -464,6 +464,12 @@ def cut_clip(src, start, dur, dst):
 
 
 FRAME = 0.05
+SONGS = []        # [(start, end)] paattu idangal - asal kural + music appadiyae irukkum (dub pannaadhu)
+
+
+def _in_song(a, b, thr=0.5):
+    d = max(b - a, 1e-6)
+    return any(min(b, e) - max(a, s_) > thr * d for s_, e in SONGS)
 
 
 def speech_mask(vocals_path):
@@ -491,6 +497,8 @@ def find_gaps(mask, lines, min_gap=1.0):
         a = max(0, int((ln["start"] - 0.3) / FRAME))
         b = min(n, int((ln["end"] + 0.3) / FRAME) + 1)
         covered[a:b] = True
+    for s_, e_ in SONGS:                                     # paattu idangalil gap fill vendaam
+        covered[max(0, int(s_ / FRAME)):min(n, int(e_ / FRAME) + 1)] = True
     miss = mask & ~covered
     gaps, i = [], 0
     while i < n:
@@ -783,7 +791,7 @@ def _read_script_text(path):
 def _extract_script_parts(raw):
     """Pala JSON paguthi (30 nimisha video-ku 5-5 nimisham) / vettupatta JSON-ilum irundhu characters + lines edukkum."""
     dec = json.JSONDecoder()
-    chars, lines = {}, []
+    chars, lines, songs = {}, [], []
     i = 0
     while True:
         i = raw.find("{", i)
@@ -808,6 +816,12 @@ def _extract_script_parts(raw):
                 off = ts_to_sec(obj.get("part_start", 0) or 0)
             except Exception:
                 off = 0.0
+            for sg in obj.get("songs") or []:
+                if isinstance(sg, dict) and "start" in sg and "end" in sg:
+                    try:
+                        songs.append((ts_to_sec(sg["start"]) + off, ts_to_sec(sg["end"]) + off))
+                    except Exception:
+                        pass
             for ln in obj.get("lines") or []:
                 if isinstance(ln, dict):
                     if off:
@@ -825,7 +839,7 @@ def _extract_script_parts(raw):
             i = end
         else:
             i += 1
-    return chars, lines
+    return chars, lines, songs
 
 
 def _md_emotion(direction):
@@ -862,7 +876,7 @@ def _md_char_traits(row_text):
 
 def _parse_markdown_script(raw):
     """Gemini-yin 'MM:SS - MM:SS | C3 (Klein) [emotion]: "vasanam"' vadivam (.md/.docx/.txt) -> characters + lines."""
-    chars, lines = {}, []
+    chars, lines, songs = {}, [], []
     hdr = re.compile(r"^(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*[–—\-]+\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*\|\s*(.*)$")
     quotes = "\"“”„‟«»"
     scene_title, scene_desc = "", ""
@@ -898,6 +912,8 @@ def _parse_markdown_script(raw):
                 rest, text = rest[:k], rest[k:]
             spk = re.search(r"\bC\d+\b", rest)
             if not spk:
+                if re.search(r"பாடல்|பாட்டு|song", rest, re.I):          # "MM:SS - MM:SS | பாடல்" -> paattu idam
+                    songs.append((m.group(1), m.group(2)))
                 cur = None
                 continue
             dm = re.findall(r"\[([^\]]*)\]", rest)
@@ -932,18 +948,18 @@ def _parse_markdown_script(raw):
         if cur is not None:                                              # vasanam adutha varigalil thodarndhaal
             cur["tamil"] = (cur["tamil"] + " " + clean.strip(quotes + " ")).strip()
     flush()
-    return chars, lines
+    return chars, lines, songs
 
 
 def load_external_script(path):
     """Gemini app-la nee eluthina script (JSON / pala paguthi / .txt / .docx)-a bot-oda format-ku maathum."""
     raw = _read_script_text(path)
-    chars_in, raw_lines = _extract_script_parts(raw)
+    chars_in, raw_lines, raw_songs = _extract_script_parts(raw)
     md_mode = False
     if not raw_lines:                                  # JSON illa -> 'MM:SS - MM:SS | C1 (..) [..]: "..."' vadivam-a try pannum
-        md_chars, md_lines = _parse_markdown_script(raw)
+        md_chars, md_lines, md_songs = _parse_markdown_script(raw)
         if md_lines:
-            chars_in, raw_lines, md_mode = md_chars, md_lines, True
+            chars_in, raw_lines, md_mode, raw_songs = md_chars, md_lines, True, md_songs
     data = {"lines": raw_lines}
     lines = []
     for ln in data.get("lines") or []:
@@ -980,14 +996,27 @@ def load_external_script(path):
     if md_mode:                                        # script-la Tamil already per-character slang-la irukku -> thirumba maatha vendaam
         for l in lines:
             l["original"] = l["tamil"]
-    return {"characters": chars, "lines": lines, "tamil_done": md_mode, "external": True}
+            l["md"] = True                             # 'original' unmaiyaana asal pechu illai (OmniVoice ref text-ku use panna koodaadhu)
+    songs_out = []
+    for a_, b_ in raw_songs:
+        try:
+            a_, b_ = ts_to_sec(a_), ts_to_sec(b_)
+            if b_ > a_:
+                songs_out.append([round(a_, 2), round(b_, 2)])
+        except Exception:
+            pass
+    return {"characters": chars, "lines": lines, "tamil_done": md_mode, "external": True, "songs": songs_out}
 
 
 def step_script(video):
+    SONGS[:] = []                                       # munnaadi job-oda paattu idangal maraiyatum
     script_path = os.path.join(WORK, "script.json")
     if os.path.exists(script_path):
         print("[2] script.json cache irukku, skip")
         cached = json.load(open(script_path, encoding="utf-8"))
+        SONGS[:] = [(float(a_), float(b_)) for a_, b_ in cached.get("songs", [])]
+        if SONGS:
+            print(f"  paattu idangal: {len(SONGS)} (asal paattu appadiyae irukkum)")
         voc_ = os.path.join(WORK, "vocals.wav")
         if cached.get("external") and not cached.get("snapped") and os.path.exists(voc_):
             try:                                   # unga script-oda neram-a asal kural neram-ku othukkum
@@ -1540,7 +1569,7 @@ def omni_prepare_refs(chars, lines, edge_voices, lang="ta"):
                                     "-t", f"{min(best['end'] - best['start'], 10.0):.2f}", "-i", voc,
                                     "-ac", "1", "-ar", str(SR), path], capture_output=True)
                 if r.returncode == 0 and os.path.exists(path):
-                    got = (path, best["original"])
+                    got = (path, None if best.get("md") else best["original"])
         if got is None and OMNI_REF != "orig_only":
             epath = os.path.join(WORK, f"ref_{lang}_{cid}.wav")
             try:                                             # asal clip illa -> edge-tts clip reference (andha mozhiyil)
@@ -1551,13 +1580,39 @@ def omni_prepare_refs(chars, lines, edge_voices, lang="ta"):
                 print(f"  ref {cid} fail: {str(e)[:100]}")
         if got:
             OMNI["refs"][cid] = got
+    OMNI["refs_emo"] = {}                                    # (character, emotion) -> andha uNarchiyil pesina asal clip
+    if mask is not None:
+        for cid in chars:
+            for emo in ("angry", "shout", "sad", "scared", "happy", "whisper"):
+                best, bscore = None, 0.0
+                for ln in lines:
+                    if ln.get("speaker") != cid or ln.get("emotion") != emo or not ln.get("original"):
+                        continue
+                    d = ln["end"] - ln["start"]
+                    if not 1.5 <= d <= 14.0:
+                        continue
+                    a, b = int(ln["start"] / FRAME), int(ln["end"] / FRAME)
+                    frac = float(mask[a:b].mean()) if b > a else 0.0
+                    score = frac * min(d, 8.0)
+                    if frac >= 0.5 and score > bscore:
+                        best, bscore = ln, score
+                if best is None:
+                    continue
+                epath = os.path.join(WORK, f"ref_{cid}_{emo}.wav")
+                r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{best['start']:.2f}",
+                                    "-t", f"{min(best['end'] - best['start'], 10.0):.2f}", "-i", voc,
+                                    "-ac", "1", "-ar", str(SR), epath], capture_output=True)
+                if r.returncode == 0 and os.path.exists(epath):
+                    OMNI["refs_emo"][(cid, emo)] = (epath, None if best.get("md") else best["original"])
+        print(f"  OmniVoice emotion reference clips: {len(OMNI['refs_emo'])}")
     n_orig = sum(1 for v in OMNI["refs"].values() if not os.path.basename(v[0]).startswith("ref_" + lang + "_"))
     print(f"  OmniVoice reference: {len(OMNI['refs'])}/{len(chars)} characters ({n_orig} asal kural clone, "
           f"{len(OMNI['refs']) - n_orig} edge-tts reference)")
 
 
 def omni_speak(text, cid, ev=None, emotion="neutral", lang="ta"):
-    m, ref = OMNI["model"], OMNI["refs"].get(cid)
+    m = OMNI["model"]
+    ref = OMNI.get("refs_emo", {}).get((cid, emotion)) or OMNI["refs"].get(cid)   # andha uNarchi clip irundhaa adhai use pannum
     if m is None or ref is None or time.time() < OMNI["off_until"]:
         return None
     kw = {}
@@ -1576,7 +1631,9 @@ def omni_speak(text, cid, ev=None, emotion="neutral", lang="ta"):
             torch.manual_seed(sum(ord(ch) for ch in str(cid)) * 7919 % 2**31)
         except Exception:  # noqa
             pass
-        out = m.generate(text=text, ref_audio=ref[0], ref_text=ref[1], **kw)
+        if ref[1]:
+            kw["ref_text"] = ref[1]                            # transcript illaiyaa OmniVoice thaanaaga ketkum
+        out = m.generate(text=text, ref_audio=ref[0], **kw)
     a = np.asarray(out[0] if isinstance(out, (list, tuple)) else out, dtype=np.float32).reshape(-1)
     if len(a) < int(0.2 * SR):
         raise RuntimeError("OmniVoice too short")
@@ -1664,6 +1721,33 @@ def step_tts(script, texts, lang="ta", p0=50, p1=90):
 
 
 # ----------------------------- STEP 5: mix ----------------------------------
+def add_song_vocals(track):
+    """Paattu idangalil asal paadal kural (vocals.wav) muzhusaa serkkum; music ('no_vocals') BGM-la already irukku."""
+    voc = os.path.join(WORK, "vocals.wav")
+    if not SONGS or not os.path.exists(voc):
+        return 0
+    try:
+        r = subprocess.run(["ffmpeg", "-v", "error", "-i", voc, "-ac", "1", "-ar", str(SR), "-f", "s16le", "-"],
+                           capture_output=True)
+        x = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    except Exception as e:  # noqa
+        print("  song vocals fail:", str(e)[:120])
+        return 0
+    n = 0
+    for s_, e_ in SONGS:
+        i0, i1 = int(max(0, s_) * SR), min(len(x), len(track), int(e_ * SR))
+        if i1 - i0 < SR:
+            continue
+        seg = x[i0:i1].copy()
+        f = min(len(seg) // 2, int(0.3 * SR))
+        if f > 0:
+            seg[:f] *= np.linspace(0, 1, f, dtype=np.float32)
+            seg[-f:] *= np.linspace(1, 0, f, dtype=np.float32)
+        track[i0:i1] += seg
+        n += 1
+    return n
+
+
 def keep_original_where_undubbed(track, lines, audios):
     """Dub kural varaadha idathula 'music mattum' kekkaamal, asal kural-a (vocals.wav) serkkum."""
     voc = os.path.join(WORK, "vocals.wav")
@@ -1686,6 +1770,8 @@ def keep_original_where_undubbed(track, lines, audios):
     for s_, e_ in segs:
         if any(min(e_, b) - max(s_, a) > 0.15 for a, b in spans):
             continue
+        if any(min(e_, b) - max(s_, a) > 0.15 for a, b in SONGS):      # paattu idam already serthachu
+            continue
         i0, i1 = int(max(0, s_ - 0.1) * SR), min(len(x), len(track), int((e_ + 0.1) * SR))
         if i1 - i0 < int(0.2 * SR):
             continue
@@ -1704,6 +1790,10 @@ def mix_language(total, bgm, lines, audios, lang):
     """Oru mozhiyin kural + BGM-a kalandhu oru audio file (m4a) aakkum. Video length-ke sariyaa irukkum."""
     check_cancel()
     track = np.zeros(int((total + 5) * SR), dtype=np.float32)
+    if SONGS:                                                 # paattu idangal: dub varigal vendaam, asal paattu-a serkkum
+        keep = [(ln, a) for ln, a in zip(lines, audios) if not _in_song(ln["start"], ln["start"] + len(a) / SR)]
+        lines, audios = [k[0] for k in keep], [k[1] for k in keep]
+        print(f"  paattu: {add_song_vocals(track)} idathula asal paattu serthom")
     for ln, a in zip(lines, audios):
         s = int(ln["start"] * SR)
         e = min(len(track), s + len(a))
