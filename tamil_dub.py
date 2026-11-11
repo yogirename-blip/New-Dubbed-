@@ -1211,6 +1211,19 @@ def step_translate(script, lang):
                 print(f"  translate {lang} fail (try {attempt + 1}/3): {str(e)[:150]}")
                 time.sleep(3)
         json.dump(texts, open(path, "w", encoding="utf-8"), ensure_ascii=False)
+    still = {i: (lines[i].get("english") or lines[i].get("original") or "").strip()
+             for i in range(len(lines)) if not in_script(texts[i], L["rng"])}
+    still = {i: t for i, t in still.items() if t}
+    if still:                                          # Gemini mudiyaadha varigal -> offline NLLB (asal kural-a vida nallathu)
+        print(f"  {len(still)} varigal Gemini-la varala -> NLLB offline try...")
+        ok = 0
+        for i, t in nllb_translate(still, lang).items():
+            if t and in_script(t, L["rng"]):
+                texts[i] = t
+                ok += 1
+        if ok:
+            print(f"  NLLB: {ok} varigal mozhipeyarthathu")
+            json.dump(texts, open(path, "w", encoding="utf-8"), ensure_ascii=False)
     missing = sum(1 for t in texts if not in_script(t, L["rng"]))
     if missing:
         print(f"  {missing} varigal {L['name']}-la mozhipeyarkka mudiyala")
@@ -1501,6 +1514,10 @@ OMNI_REF = os.environ.get("OMNI_REF", "orig")                # edge = Tamil kura
 OMNI_PACE = os.environ.get("OMNI_PACE", "none")                # edge = Tamil TTS-oda vegam/nadai-ya eduthukkum, speed = OMNI_SPEED, none = model-oda vegam
 OMNI_SPEED = float(os.environ.get("OMNI_SPEED", "1.0"))     # OMNI_PACE=speed na use aagum (1.0 = normal)
 OMNI_LANG = os.environ.get("OMNI_LANG", "")                    # "auto" -> ovvoru mozhikkum adhoda code-a sollum | "ta" pola kuduthaa adhai ellaathukkum                    # "ta" kuduthaa language-a sollum (default: sollaadhu - munnaadi mathiri)
+
+OMNI_FIT = os.environ.get("OMNI_FIT", "1") != "0"             # 1 -> neelamaana varigalai atempo-vukku munnaadi OmniVoice-ae neram-ku othukki pesum (iyalbaana vegam)
+LOUD_MATCH = os.environ.get("LOUD_MATCH", "1") != "0"         # 1 -> ovvoru dub varium asal kural-oda sathathukku (shout/whisper/normal) othukkum
+NLLB_FALLBACK = os.environ.get("NLLB_FALLBACK", "1") != "0"   # 1 -> Gemini mozhipeyarkka mudiyaadha varigalai offline NLLB-200 mozhipeyarkkum
 EDGE_REF_TEXT = "வணக்கம், நான் உங்க கூட கொஞ்சம் பேசணும். இன்னைக்கு என்ன நடந்துச்சுன்னு சொல்லுங்க, நான் கேக்குறேன்."
 OMNI = {"model": None, "refs": {}, "tried": False, "fails": 0, "off_until": 0.0}
 _omni_lock = threading.Lock()
@@ -1610,7 +1627,7 @@ def omni_prepare_refs(chars, lines, edge_voices, lang="ta"):
           f"{len(OMNI['refs']) - n_orig} edge-tts reference)")
 
 
-def omni_speak(text, cid, ev=None, emotion="neutral", lang="ta"):
+def omni_speak(text, cid, ev=None, emotion="neutral", lang="ta", fit=None):
     m = OMNI["model"]
     ref = OMNI.get("refs_emo", {}).get((cid, emotion)) or OMNI["refs"].get(cid)   # andha uNarchi clip irundhaa adhai use pannum
     if m is None or ref is None or time.time() < OMNI["off_until"]:
@@ -1621,6 +1638,8 @@ def omni_speak(text, cid, ev=None, emotion="neutral", lang="ta"):
             kw["duration"] = round(len(edge_tts_np(text, ev, emotion)) / SR + 0.15, 2)
         except Exception:  # noqa
             kw = {}
+    if fit is not None:                                      # varikku othukkina neram-ku ore kural-lae pesum (atempo-vukku badhil)
+        kw = {"duration": round(float(fit), 2)}
     if not kw and OMNI_PACE != "none" and OMNI_SPEED != 1.0:
         kw["speed"] = OMNI_SPEED
     with _omni_lock:                                         # oru GPU model -> orey nerathula onnu
@@ -1640,6 +1659,115 @@ def omni_speak(text, cid, ev=None, emotion="neutral", lang="ta"):
     return trim_silence(a)
 
 
+# ------------------- Asal kural-ku othukkura (loudness) + offline NLLB fallback -------------------
+ENV_HOP = int(0.02 * SR)          # 20ms frame
+
+
+def orig_envelope():
+    """vocals.wav-oda 20ms RMS envelope (asal nadigar kural evvalavu sathama irukku). Memory kuraiya chunk-aa padikkum."""
+    voc = os.path.join(WORK, "vocals.wav")
+    if not os.path.exists(voc):
+        return None
+    try:
+        r = subprocess.run(["ffmpeg", "-v", "error", "-i", voc, "-ac", "1", "-ar", str(SR), "-f", "s16le", "-"],
+                           capture_output=True)
+        x = np.frombuffer(r.stdout, dtype=np.int16)
+        n = len(x) // ENV_HOP
+        if n < 10:
+            return None
+        env = np.zeros(n, dtype=np.float32)
+        B = 4000
+        for a in range(0, n, B):
+            b = min(n, a + B)
+            fr = x[a * ENV_HOP: b * ENV_HOP].astype(np.float32).reshape(b - a, ENV_HOP) / 32768.0
+            env[a:b] = np.sqrt((fr ** 2).mean(axis=1))
+        return env
+    except Exception as e:  # noqa
+        print("  loudness envelope fail:", str(e)[:120])
+        return None
+
+
+def _active_rms(env):
+    """Pechu irukkura frame-gal mattum (mouna idaiveli ellaam vittu) RMS."""
+    if len(env) < 5:
+        return None
+    thr = max(0.004, 0.25 * float(np.percentile(env, 90)))
+    act = env[env > thr]
+    if len(act) < 5:
+        return None
+    return float(np.sqrt((act ** 2).mean()))
+
+
+def match_loudness(a, env, start, end):
+    """Dub varium, asal varigal pesina sathathukku (kathal / mella / normal) othukkum. Mix-la voice:BGM balance asal maathiriye irukkum."""
+    if env is None or len(a) < int(0.3 * SR):
+        return a
+    try:
+        i0, i1 = int(start / 0.02), int(end / 0.02) + 1
+        target = _active_rms(env[i0:i1])
+        n = len(a) // ENV_HOP
+        if target is None or n < 5:
+            return a
+        d = np.sqrt((a[: n * ENV_HOP].reshape(n, ENV_HOP) ** 2).mean(axis=1))
+        cur = _active_rms(d)
+        if cur is None or cur < 1e-5:
+            return a
+        g = float(np.clip(target / cur, 0.35, 3.0))
+        out = a * g
+        pk = float(np.abs(out).max())
+        if pk > 0.97:
+            out *= 0.97 / pk
+        return out.astype(np.float32)
+    except Exception:  # noqa
+        return a
+
+
+NLLB_CODES = {"ta": "tam_Taml", "te": "tel_Telu", "ml": "mal_Mlym", "kn": "kan_Knda", "hi": "hin_Deva"}
+_NLLB = {"tried": False, "tok": None, "model": None}
+
+
+def nllb_translate(src_by_idx, lang):
+    """Gemini-yaal mudiyaadha varigalukku offline NLLB-200 (open-dubbing project-la use pannura engine). {idx: text}"""
+    if not NLLB_FALLBACK or not src_by_idx or lang not in NLLB_CODES:
+        return {}
+    try:
+        import torch
+        if not _NLLB["tried"]:
+            _NLLB["tried"] = True
+            from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+            name = "facebook/nllb-200-distilled-600M"
+            print("  NLLB model etthuthu (modhal thadavai ~2.4GB download)...")
+            _NLLB["tok"] = AutoTokenizer.from_pretrained(name, src_lang="eng_Latn")
+            m = AutoModelForSeq2SeqLM.from_pretrained(name)
+            if torch.cuda.is_available():
+                m = m.half().to("cuda")
+            _NLLB["model"] = m.eval()
+        tok, m = _NLLB["tok"], _NLLB["model"]
+        if m is None:
+            return {}
+        dev = next(m.parameters()).device
+        bos = tok.convert_tokens_to_ids(NLLB_CODES[lang])
+        items, out = list(src_by_idx.items()), {}
+        for a in range(0, len(items), 16):
+            check_cancel()
+            batch = items[a: a + 16]
+            enc = tok([t for _, t in batch], return_tensors="pt", padding=True, truncation=True,
+                      max_length=200).to(dev)
+            with torch.no_grad():
+                ids = m.generate(**enc, forced_bos_token_id=bos, max_new_tokens=200, num_beams=4)
+            for (i, _), r in zip(batch, tok.batch_decode(ids, skip_special_tokens=True)):
+                out[i] = r.strip()
+        return out
+    except Cancelled:
+        raise
+    except Exception as e:  # noqa
+        _NLLB["model"] = None
+        print("  NLLB fallback fail:", str(e)[:150])
+        return {}
+
+
+
+
 def step_tts(script, texts, lang="ta", p0=50, p1=90):
     chars, lines = script["characters"], script["lines"]
     L = LANGS[lang]
@@ -1654,6 +1782,9 @@ def step_tts(script, texts, lang="ta", p0=50, p1=90):
         omni_prepare_refs(chars, lines, edge_voices, lang)
     todo = [i for i in range(len(lines)) if str(texts[i]).strip()]
     first_edge = L["edge"]["male"][0]
+    env = orig_envelope() if LOUD_MATCH else None
+    if env is not None:
+        print("  asal kural sathathukku othukkum (loudness match) ON")
 
     def wav_path(i):
         return os.path.join(tdir, f"{i:05d}.wav")
@@ -1679,6 +1810,7 @@ def step_tts(script, texts, lang="ta", p0=50, p1=90):
             print(f"  line {i} TTS fail: {str(e)[:120]}")
             return i, np.zeros(int(0.1 * SR), dtype=np.float32)
         dur = len(audio) / SR
+        cur_text = text
         if dur > allowed * 1.25 and len(text) > 12:
             try:
                 short = shorten(text, max(0.5, allowed / dur), lang)
@@ -1688,10 +1820,20 @@ def step_tts(script, texts, lang="ta", p0=50, p1=90):
                     audio = speak(short, vname, system, ev, emo, ln["speaker"], lang)
                     ln.setdefault("short", {})[lang] = short
                     dur = len(audio) / SR
+                    cur_text = short
             except Exception as e:  # noqa
                 print(f"  line {i} shorten fail: {str(e)[:100]}")
+        if OMNI_FIT and dur > allowed * 1.05 and OMNI["model"] is not None:
+            try:                                   # atempo (vegam-aakki) badhil: model-ae andha neram-la iyalbaa pesum
+                fit_t = max(allowed, dur / MAX_SPEEDUP)
+                a2 = omni_speak(cur_text, ln["speaker"], ev, emo, lang, fit=fit_t)
+                if a2 is not None and 0.7 * fit_t <= len(a2) / SR <= dur * 1.02:
+                    audio, dur = a2, len(a2) / SR
+            except Exception as e:  # noqa
+                print(f"  line {i} fit fail: {str(e)[:100]}")
         if dur > allowed:
             audio = speed_np(audio, min(dur / allowed, MAX_SPEEDUP))
+        audio = match_loudness(audio, env, ln["start"], ln["end"])
         audio = declick(audio)
         write_wav(path, audio)
         return i, audio
